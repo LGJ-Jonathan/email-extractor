@@ -49,7 +49,14 @@ class Settings(BaseSettings):
     # 30s was sized when a domain fetched ~2 pages with no bucket contention. With the
     # early stop off (5 pages) and Jina paced at 500 rpm, a domain can spend most of its
     # budget queueing: 288 of 845 domains expired on the real list.
-    domain_timeout_s: int = 90           # hard wall-clock cap per domain (spec 16)
+    #
+    # 90 then became too tight in turn. It assumed a ~7s page, but the Jina call now
+    # waits jina_timeout_s + JinaFetcher.CLIENT_MARGIN_S = 15s so that Jina's own
+    # deadline expires first. Worst case went from ~35s (3 ladder rungs + robots +
+    # sitemap) to ~75s before retries, and domain_timeout went 6x on the real list:
+    # 18 of 491 domains against 3 in the run before it, costing 3 addresses outright.
+    # Keep this above 2 x the worst-case ladder whenever the per-page budget moves.
+    domain_timeout_s: int = 180          # hard wall-clock cap per domain (spec 16)
     max_domain_attempts: int = 3
     retry_pass_delay_s: int = 600        # delay before re-running transient failures (spec 17)
     user_agent: str = "Mozilla/5.0 (compatible; ContactFinder/1.0)"

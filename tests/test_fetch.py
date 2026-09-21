@@ -470,3 +470,21 @@ async def test_direct_site_fetches_keep_the_tight_timeout():
     )
     await HttpxFetcher(g).get_text("https://acme.com/robots.txt")
     assert route.calls[0].request.extensions["timeout"]["read"] == F.settings.read_timeout_s
+
+
+def test_the_domain_deadline_outlasts_the_page_ladder():
+    """DOMAIN_TIMEOUT_S=90 was sized for a 7s page. Widening the Jina budget to 15s so
+    that Jina's deadline expires first took the worst-case ladder to ~75s, and
+    domain_timeout went 6x on the real list -- 18 of 491 domains against 3 before it.
+    Whichever budget moves next, this relationship is the one that must hold."""
+    page_budget = F.settings.jina_timeout_s + JinaFetcher.CLIENT_MARGIN_S
+    # Worst case before retries: three homepage rungs, then robots and sitemap, then
+    # the contact page and the remaining wave.
+    worst_case_ladder = 3 * page_budget + 2 * F.settings.read_timeout_s + 2 * page_budget
+    # 2x, so the deadline also absorbs retry backoff and time queued on the bucket
+    # rather than only the fetches themselves.
+    assert F.settings.domain_timeout_s >= 2 * worst_case_ladder, (
+        f"domain_timeout_s={F.settings.domain_timeout_s} leaves no room for a "
+        f"{worst_case_ladder:.0f}s worst-case ladder plus queueing"
+    )
+    assert page_budget > F.settings.jina_timeout_s, "our deadline must outlast Jina's"
