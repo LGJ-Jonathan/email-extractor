@@ -289,8 +289,11 @@ async def test_provider_status_returns_only_balances(monkeypatch):
     ts_route = respx.get(providers.TYPESAFE_MODELS_URL).mock(return_value=httpx.Response(200, json={}))
 
     class FakeSession:
-        async def execute(self, _):
+        async def execute(self, *_a, **_k):
             class R:
+                def all(self):              # provider_keys.refresh: no saved keys
+                    return []
+
                 def mappings(self):
                     class M:
                         def one(self):
@@ -336,3 +339,42 @@ def test_sslmode_disable_is_kept_explicit():
 
     assert Settings(database_url="postgresql://u@h/d?sslmode=disable&application_name=").database_url \
         == "postgresql+asyncpg://u@h/d?application_name=&ssl=disable"
+
+
+# --- provider keys ---------------------------------------------------------
+
+
+def _master(monkeypatch):
+    import base64
+    import os as _os
+
+    monkeypatch.setattr(settings, "provider_key_encryption_key",
+                        base64.b64encode(_os.urandom(32)).decode())
+
+
+def test_provider_key_encryption_round_trips_and_is_bound_to_the_provider(monkeypatch):
+    from app import provider_keys as pk
+
+    _master(monkeypatch)
+    ct, nonce = pk.encrypt("jina", "jina_secret_value_123")
+    assert "jina_secret_value_123" not in ct
+    assert pk.decrypt("jina", ct, nonce) == "jina_secret_value_123"
+    with pytest.raises(Exception):
+        pk.decrypt("typesafe", ct, nonce)          # a Jina row copied into TypeSafe's
+
+
+def test_key_store_refuses_without_a_master_key(monkeypatch):
+    from app import provider_keys as pk
+
+    monkeypatch.setattr(settings, "provider_key_encryption_key", "")
+    with pytest.raises(pk.KeyStoreUnavailable):
+        pk.encrypt("jina", "x" * 20)
+
+
+def test_environment_key_is_the_fallback(monkeypatch):
+    from app import provider_keys as pk
+
+    pk.reset_for_tests()
+    monkeypatch.setattr(settings, "jina_api_key", "env_jina_key_abcd")
+    assert pk.current("jina") == "env_jina_key_abcd" and pk.source("jina") == "environment"
+    assert pk.describe()["jina"]["last4"] == "abcd"

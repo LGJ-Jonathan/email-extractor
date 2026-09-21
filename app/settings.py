@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     jina_api_key: str = ""
     jina_rpm: int = 500
     jina_timeout_s: int = 10
+    # base64 of 32 random bytes; required to save provider keys from the portal.
+    provider_key_encryption_key: str = ""
     # Below this the portal shows Jina credit as "low". A 50k-row job spends ~1.3B.
     jina_low_balance_tokens: int = 100_000_000
     # "redis" shares one Jina budget across the API and every worker process. "local"
@@ -103,6 +105,13 @@ class Settings(BaseSettings):
     max_active_jobs_per_user: int = 3    # queued + running + paused
     rate_limit_per_minute: int = 120     # per person; status polling is exempt; 0 = off
     max_upload_bytes: int = 50 * 1024 * 1024
+    # A 50 MB file takes ~400 MB of memory while it is parsed; more than this many at
+    # once wait (then get 503 busy) instead of running the API out of memory.
+    max_concurrent_uploads: int = 2
+    # Estimates before a job starts: the recent fetch rate when there is enough of it,
+    # else this. Measured ~45/min on the 16k-domain run at JINA_RPM=500.
+    typical_domains_per_minute: float = 40.0
+    upload_wait_s: int = 60             # one 50k-row job takes ~20 s to create
     webhook_timeout_s: int = 10
     webhook_secret: str = ""             # set to HMAC-sign deliveries
     allow_http_webhooks: bool = False    # plain http leaks results in transit

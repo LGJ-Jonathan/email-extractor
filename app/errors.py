@@ -59,6 +59,9 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "provider_quota_exhausted": (503, "the fetch provider account is out of credit or "
                                       "rejecting the key; jobs are paused, not failed"),
     "service_unavailable": (503, "the database or queue is unreachable"),
+    "busy": (503, "other large uploads are being processed; retry shortly"),
+    "invalid_provider_key": (422, "the provider rejected this key"),
+    "key_store_unavailable": (503, "PROVIDER_KEY_ENCRYPTION_KEY is not configured"),
 }
 
 _GENERIC_BY_STATUS = {
@@ -129,6 +132,22 @@ class RequestId:
         await self.app(scope, receive, send_with_id)
 
 
+def _is_connection_error(exc) -> bool:
+    try:
+        import asyncpg
+    except ImportError:  # pragma: no cover
+        return False
+    inner = getattr(exc, "__cause__", None) if exc is not None else None
+    for e in (exc, inner):
+        if isinstance(e, (asyncpg.exceptions.CannotConnectNowError,
+                          asyncpg.exceptions.TooManyConnectionsError,
+                          asyncpg.exceptions.ConnectionDoesNotExistError,
+                          asyncpg.exceptions.ConnectionFailureError,
+                          ConnectionError)):
+            return True
+    return False
+
+
 def _is_outage(exc: BaseException) -> bool:
     """A dependency being down, as opposed to a bug. Bare OSError is deliberately not
     here: FileNotFoundError or a stray TimeoutError is a bug, and calling it an outage
@@ -140,16 +159,17 @@ def _is_outage(exc: BaseException) -> bool:
 
     # socket.gaierror: the database or Redis host does not resolve (asyncpg raises it
     # unwrapped). Unlike the rest of OSError it can only mean a dependency is missing.
-    if isinstance(exc, (OperationalError, InterfaceError, PoolTimeout, ConnectionError,
-                        socket.gaierror)):
+    # Not sqlalchemy's InterfaceError as such: asyncpg raises its base InterfaceError
+    # for client-side misuse too (e.g. more than 32,767 query arguments), which is a
+    # bug, not an outage. Only the connection-specific subclasses below mean "down".
+    if isinstance(exc, (OperationalError, PoolTimeout, ConnectionError, socket.gaierror)):
+        return True
+    if isinstance(exc, InterfaceError) and _is_connection_error(getattr(exc, "orig", None)):
         return True
     try:
         import asyncpg
 
-        if isinstance(exc, (asyncpg.exceptions.CannotConnectNowError,
-                            asyncpg.exceptions.TooManyConnectionsError,
-                            asyncpg.exceptions.ConnectionDoesNotExistError,
-                            asyncpg.exceptions.InterfaceError)):
+        if _is_connection_error(exc):
             return True
     except ImportError:  # pragma: no cover
         pass

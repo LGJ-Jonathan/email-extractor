@@ -27,6 +27,7 @@ import httpx
 from pydantic import BaseModel
 
 from app.ratelimit import CircuitOpen, FetchGate, jittered
+from app.provider_keys import current as current_key
 from app.settings import settings
 
 log = logging.getLogger("email_extractor.fetch")
@@ -388,7 +389,7 @@ class JinaFetcher(_BaseFetcher):
 
     def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {settings.jina_api_key}",
+            "Authorization": f"Bearer {current_key('jina')}",
             "Accept": "application/json",
             "X-Engine": "direct",
             "X-Respond-With": "html",

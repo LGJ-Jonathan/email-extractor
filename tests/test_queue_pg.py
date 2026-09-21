@@ -7,6 +7,7 @@ how often a domain is fetched, and what survives a crash -- not about extraction
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -966,3 +967,101 @@ async def test_providers_status_endpoint_shape(db, api_key, monkeypatch):
     providers.reset_cache()
     assert body["jina"] == {"status": "low", "balance_tokens": 42}
     assert set(body["usage_this_month"]) == {"jina_tokens", "typesafe_calls", "domains_fetched"}
+
+
+# --- provider keys, estimates, big jobs ------------------------------------
+
+
+async def test_admin_saves_a_checked_key_and_paused_jobs_resume(db, monkeypatch, api_key):
+    import base64
+    import os as _os
+
+    import httpx
+
+    from app import provider_keys, providers, queue
+    from app.main import app
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "provider_key_encryption_key",
+                        base64.b64encode(_os.urandom(32)).decode())
+    provider_keys.reset_for_tests()
+
+    async def fake_balance(client, key):
+        return 5_000_000_000 if key == "jina_good_key_1234" else None
+
+    monkeypatch.setattr(providers, "jina_balance", fake_balance)
+    job = await make_job(db, ["r1.com"])
+    async with db() as s:
+        await queue.pause_active_jobs(s, "jina_account")
+
+    svc = await make_service(db)
+    admin = {"X-API-Key": svc, "X-Acting-User": "boss@x.com", "X-Acting-Role": "admin"}
+    staff = {"X-API-Key": svc, "X-Acting-User": "staff@x.com"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.put("/providers/keys/jina", json={"key": "jina_good_key_1234"}, headers=staff)
+        assert r.status_code == 403
+        r = await c.put("/providers/keys/jina", json={"key": "jina_bad_key_0000"}, headers=admin)
+        assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_provider_key"
+        r = await c.put("/providers/keys/jina", json={"key": "jina_good_key_1234"}, headers=admin)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["last4"] == "1234" and body["resumed_jobs"] == 1 and body["status"] == "ok"
+        assert "jina_good_key_1234" not in r.text
+        keys = (await c.get("/providers/keys", headers=admin)).json()
+        assert keys["keys"]["jina"]["source"] == "portal" and keys["keys"]["jina"]["updated_by"] == "boss@x.com"
+        assert "jina_good_key_1234" not in json.dumps(keys)
+        assert (await c.put("/providers/keys/nope", json={"key": "x" * 12}, headers=admin)).status_code == 404
+    async with db() as s:
+        stored = await s.scalar(text("SELECT ciphertext FROM provider_keys WHERE provider='jina'"))
+        assert "jina_good_key_1234" not in stored
+        assert await job_status(s, job.id) == "running"
+    assert provider_keys.current("jina") == "jina_good_key_1234"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.delete("/providers/keys/jina", headers=admin)
+        assert r.status_code == 200
+    assert provider_keys.source("jina") != "portal"
+    provider_keys.reset_for_tests()
+
+
+async def test_estimate_uses_the_typical_rate_until_there_is_data(db, api_key, monkeypatch):
+    import httpx
+
+    from app import providers
+    from app.main import app
+
+    async def fake_status(session):
+        return {"jina": {"status": "ok", "balance_tokens": 1}, "typesafe": {"status": "ok"},
+                "usage_this_month": {}, "jina_low_threshold": 1, "checked_at": ""}
+
+    monkeypatch.setattr(providers, "provider_status", fake_status)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        e = (await c.get("/estimate?domains=400", headers={"X-API-Key": api_key})).json()
+        assert e["basis"] == "typical" and e["people_running"] == 0
+        assert e["eta_seconds"]["low"] < 600 < e["eta_seconds"]["high"]      # ~10 min at 40/min
+        bad = await c.get("/estimate?domains=60000", headers={"X-API-Key": api_key})
+        assert bad.status_code == 422
+
+
+async def test_job_list_carries_progress(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    job = await make_job(db, ["p1.com", "p2.com", "p3.com"])
+    async with db() as s:
+        await s.execute(text("UPDATE job_domains SET state='done', status='found' "
+                             "WHERE domain='p1.com'"))
+        await s.commit()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        j = (await c.get("/jobs", headers={"X-API-Key": api_key})).json()["jobs"][0]
+    assert j["job_id"] == str(job.id)
+    assert (j["done"], j["unique_domains"], j["found"]) == (1, 3, 1)
+
+
+async def test_a_job_with_more_than_32767_domains_is_created(db):
+    """asyncpg allows 32,767 parameters per statement; every large job used to fail."""
+    job = await make_job(db, [f"domain{i}-shop.com" for i in range(40_000)])
+    async with db() as s:
+        n = await s.scalar(text("SELECT count(*) FROM job_domains WHERE job_id = :j"),
+                           {"j": job.id})
+    assert n == 40_000

@@ -27,6 +27,7 @@ import httpx
 
 from app.pipeline.filter_rank import RankedEmail
 from app.ratelimit import CircuitBreaker, CircuitOpen
+from app.provider_keys import current as current_key
 from app.settings import settings
 
 log = logging.getLogger("email_extractor.typesafe")
@@ -257,7 +258,7 @@ class TypeSafeClient:
                         json=body,
                         timeout=TIMEOUT_S,
                         headers={
-                            "Authorization": f"Bearer {settings.typesafe_api_key}",
+                            "Authorization": f"Bearer {current_key('typesafe')}",
                             "Content-Type": "application/json",
                         },
                     )

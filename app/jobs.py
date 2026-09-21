@@ -219,43 +219,54 @@ async def create_job(
     session.add(job)
     await session.flush()
 
-    session.add_all(
-        JobItem(
-            job_id=job.id,
-            row_index=it.row_index,
-            input_value=it.input_value,
-            domain=it.domain,
-            status=it.status,
-            reason=it.reason,
-            domain_source=it.domain_source,
-            raw_row=it.raw_row,
+    # Core inserts in chunks, not 50k ORM objects: the ORM unit of work roughly
+    # doubled the memory an upload took, and each chunk stays far under asyncpg's
+    # 32,767-parameter limit (8 columns x 2,000 rows).
+    for chunk in _chunks(items, 2000):
+        await session.execute(
+            pg_insert(JobItem).values([
+                {
+                    "job_id": job.id,
+                    "row_index": it.row_index,
+                    "input_value": it.input_value,
+                    "domain": it.domain,
+                    "status": it.status,
+                    "reason": it.reason,
+                    "domain_source": it.domain_source,
+                    "raw_row": it.raw_row,
+                }
+                for it in chunk
+            ])
         )
-        for it in items
-    )
 
     domains = unique_domains(items)
     cached: list[str] = []
     if domains and not fresh:
+        # One array parameter. `IN (...)` sent one parameter per domain, and asyncpg
+        # refuses more than 32,767: every job over that many domains failed.
         rows = await session.execute(
-            select(Domain.domain).where(
-                Domain.domain.in_(domains),
-                Domain.finished_at.is_not(None),
-                Domain.finished_at >= cache_cutoff(),
-                Domain.status != "fetch_failed",
-            )
+            text("""
+                SELECT domain FROM domains
+                WHERE domain = ANY(:ds) AND finished_at IS NOT NULL
+                  AND finished_at >= :cutoff AND status <> 'fetch_failed'
+            """),
+            {"ds": domains, "cutoff": cache_cutoff()},
         )
         cached = [r[0] for r in rows]
 
     if domains:
+        # 1,000-row chunks: SQLAlchemy adds every column with a Python-side default to
+        # each row (about 12 for job_domains), and asyncpg allows 32,767 parameters per
+        # statement. 5,000-row chunks came to ~60,000 and failed every large job.
         # Idempotent: a domain already known stays put, a new one starts pending.
-        for chunk in _chunks(domains, 5000):
+        for chunk in _chunks(domains, 1000):
             await session.execute(
                 pg_insert(Domain)
                 .values([{"domain": d, "stage": "pending"} for d in chunk])
                 .on_conflict_do_nothing(index_elements=[Domain.domain])
             )
         seq = 0
-        for chunk in _chunks(domains, 5000):
+        for chunk in _chunks(domains, 1000):
             await session.execute(
                 pg_insert(JobDomain).values(
                     [{"job_id": job.id, "domain": d, "seq": seq + i} for i, d in enumerate(chunk)]

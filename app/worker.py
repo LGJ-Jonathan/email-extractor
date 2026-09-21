@@ -56,6 +56,13 @@ class Worker:
         log.info("worker_start", extra={"worker": self.id, "concurrency": self.concurrency})
         slots = asyncio.Semaphore(self.concurrency)
         await self.webhooks.start()
+        try:
+            from app import provider_keys
+
+            async with self.sessions() as s:
+                await provider_keys.refresh(s, force=True)
+        except Exception:  # noqa: BLE001 - fall back to the environment's keys
+            log.exception("provider_key_refresh_failed")
         background = [asyncio.create_task(self._heartbeat_loop()),
                       asyncio.create_task(self._reap_loop())]
         try:
@@ -119,11 +126,15 @@ class Worker:
         log.info("worker_stop", extra={"worker": self.id})
 
     async def _heartbeat_loop(self) -> None:
+        from app import provider_keys
+
         while True:
             await asyncio.sleep(queue.HEARTBEAT_S)
             try:
                 async with self.sessions() as s:
                     await queue.heartbeat(s, self.id)
+                    # Keys saved from the portal take effect here without a redeploy.
+                    await provider_keys.refresh(s)
             except Exception:  # noqa: BLE001
                 log.exception("heartbeat_failed")
 

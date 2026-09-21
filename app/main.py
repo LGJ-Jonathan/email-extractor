@@ -1,11 +1,13 @@
 """FastAPI app (spec sections 5 and 14)."""
 
+import asyncio
 import hashlib
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
+import httpx
 import pydantic
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -50,11 +52,26 @@ async def lifespan(app: FastAPI):
     if not admin_key_usable():
         log.error("API_KEY is a placeholder or shorter than 32 characters; the admin key "
                   "is disabled until it is replaced")
+    refresher = asyncio.create_task(_refresh_provider_keys_forever())
     yield
+    refresher.cancel()
     from app.pipeline.fetch import close_client
 
     await close_client()
     await dispose_engine()
+
+
+async def _refresh_provider_keys_forever() -> None:
+    """Pick up keys saved from the portal (by any process) within REFRESH_S."""
+    from app import provider_keys
+
+    while True:
+        try:
+            async with get_sessionmaker()() as s:
+                await provider_keys.refresh(s)
+        except Exception:  # noqa: BLE001 - a DB blip must not stop the loop
+            log.exception("provider_key_refresh_failed")
+        await asyncio.sleep(provider_keys.REFRESH_S)
 
 
 app = FastAPI(title="Website Email Extractor", version="0.1.0", lifespan=lifespan)
@@ -167,6 +184,28 @@ async def extract(req: ExtractRequest) -> DomainResult:
 # --- jobs -----------------------------------------------------------------
 
 
+_upload_slots: asyncio.Semaphore | None = None
+
+
+@asynccontextmanager
+async def _upload_slot():
+    """At most MAX_CONCURRENT_UPLOADS files parsed at once. One 50 MB upload peaks at
+    ~400 MB while parsed; three at once exceeded the API's 1 GB and killed it for
+    everyone. Waiters get a short grace period, then a 503 they can retry."""
+    global _upload_slots
+    if _upload_slots is None:
+        _upload_slots = asyncio.Semaphore(max(1, settings.max_concurrent_uploads))
+    try:
+        await asyncio.wait_for(_upload_slots.acquire(), settings.upload_wait_s)
+    except TimeoutError:
+        raise ApiError("busy", "other large uploads are being processed; try again in a moment",
+                       retry_after=10) from None
+    try:
+        yield
+    finally:
+        _upload_slots.release()
+
+
 async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
     """Read at most max_upload_bytes + 1, so an oversized file is refused, not buffered."""
     cap = settings.max_upload_bytes
@@ -185,16 +224,17 @@ async def jobs_preview(
 
     Pass `column` to preview a different column than the detected one.
     """
-    raw, filename = await _read_upload(file)
-    try:
-        parsed = parse_bytes(raw, filename)
-    except IngestError as e:
-        raise ApiError(e.code, str(e)) from e
-    if column and column not in parsed.headers:
-        raise ApiError("unknown_column", f"the file has no column named {column!r}",
-                       details={"columns": parsed.headers})
-    guess = detect_column(parsed)
-    return {"filename": filename, **preview(parsed, guess, column=column)}
+    async with _upload_slot():
+        raw, filename = await _read_upload(file)
+        try:
+            parsed = parse_bytes(raw, filename)
+        except IngestError as e:
+            raise ApiError(e.code, str(e)) from e
+        if column and column not in parsed.headers:
+            raise ApiError("unknown_column", f"the file has no column named {column!r}",
+                           details={"columns": parsed.headers})
+        guess = detect_column(parsed)
+        return {"filename": filename, **preview(parsed, guess, column=column)}
 
 
 IDEMPOTENCY_KEY_MAX = 200
@@ -242,6 +282,16 @@ async def create_job(
     fresh: bool = Form(default=False),
 ) -> dict:
     """Spec 5: JSON body of items, or a multipart file upload."""
+    if file is not None:
+        async with _upload_slot():
+            return await _create_job(request, who, session, idempotency_key, file, column,
+                                     webhook_url, fresh)
+    return await _create_job(request, who, session, idempotency_key, None, column,
+                             webhook_url, fresh)
+
+
+async def _create_job(request, who, session, idempotency_key, file, column, webhook_url,
+                      fresh) -> dict:
     if file is not None:
         raw, filename = await _read_upload(file)
         try:
@@ -377,6 +427,33 @@ async def get_job(
         "active_seconds": await _active_seconds(session, job.id),
         "columns": list(job.columns or ["website"]),
         **counts,
+    }
+
+
+_LIST_PROGRESS = text("""
+SELECT j.id,
+       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id) AS unique_domains,
+       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id AND q.state = 'done') AS done,
+       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id AND q.state = 'done'
+                                              AND q.status = 'found') AS found,
+       CASE WHEN j.started_at IS NULL THEN NULL ELSE greatest(0,
+           extract(epoch FROM coalesce(j.finished_at, now()) - j.started_at) - j.paused_seconds
+           - CASE WHEN j.paused_at IS NOT NULL AND j.finished_at IS NULL
+                  THEN extract(epoch FROM now() - greatest(j.paused_at, j.started_at))
+                  ELSE 0 END) END AS active_seconds
+FROM jobs j WHERE j.id = ANY(:ids)
+""")
+
+
+async def _list_progress(session: AsyncSession, ids: list) -> dict:
+    """Per-job progress for the job list's status bars, in one query."""
+    if not ids:
+        return {}
+    rows = await session.execute(_LIST_PROGRESS, {"ids": ids})
+    return {
+        r.id: {"done": r.done, "unique_domains": r.unique_domains, "found": r.found,
+               "active_seconds": None if r.active_seconds is None else float(r.active_seconds)}
+        for r in rows
     }
 
 
@@ -543,6 +620,177 @@ async def cancel_job(
     return {"job_id": str(job.id), "status": "cancelled"}
 
 
+_RATE = text("""
+SELECT count(*) FILTER (WHERE NOT from_cache) AS fetched,
+       count(*) FILTER (WHERE from_cache) AS cached
+FROM job_domains
+WHERE state = 'done' AND finished_at >= now() - interval '15 minutes'
+""")
+
+_OTHERS = text("""
+SELECT count(DISTINCT coalesce(j.owner_id::text, 'admin'))
+FROM jobs j
+WHERE j.status IN ('queued', 'running')
+  AND coalesce(j.owner_id::text, 'admin') <> :me
+  AND EXISTS (SELECT 1 FROM job_domains q
+              WHERE q.job_id = j.id AND q.state IN ('queued', 'running'))
+""")
+
+ESTIMATE_WINDOW_MIN = 15
+MIN_SAMPLE = 30
+
+
+@app.get("/estimate")
+async def estimate(
+    domains: int,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """How long `domains` new domains should take, before a job is started.
+
+    The worker's capacity is shared: each free slot goes to the person with the fewest
+    domains in flight. So the estimate is this person's fair share of the recent fetch
+    rate. A range, because site speed varies a lot and cache hits are unknown upfront.
+    """
+    if domains < 0 or domains > MAX_ITEMS_PER_JOB:
+        raise ApiError("validation_error", f"domains must be 0-{MAX_ITEMS_PER_JOB:,}",
+                       details=[{"field": "domains", "msg": "out of range"}])
+    rate = (await session.execute(_RATE)).mappings().one()
+    fetched = int(rate["fetched"] or 0)
+    others = int(await session.scalar(_OTHERS, {"me": str(who.user_id) if who.user_id else "admin"}) or 0)
+    if fetched >= MIN_SAMPLE:
+        total_rate = fetched / ESTIMATE_WINDOW_MIN
+        basis = "recent"
+    else:
+        total_rate = settings.typical_domains_per_minute
+        basis = "typical"
+    my_rate = total_rate / (others + 1)
+    minutes = domains / my_rate if my_rate > 0 else None
+
+    from app.providers import provider_status
+
+    vendors = await provider_status(session)
+    return {
+        "domains": domains,
+        "basis": basis,
+        "rate_per_minute": round(total_rate, 1),
+        "your_rate_per_minute": round(my_rate, 1),
+        "people_running": others,
+        "eta_seconds": None if minutes is None else {
+            "low": round(minutes * 60 * 0.7), "high": round(minutes * 60 * 1.4),
+        },
+        "blocked_by": "jina_credit" if vendors["jina"]["status"] == "empty" else None,
+    }
+
+
+class ProviderKeyBody(pydantic.BaseModel):
+    key: str = pydantic.Field(min_length=10, max_length=300, pattern=r"^\S+$")
+
+
+def _require_admin(who: Principal) -> None:
+    if not who.is_admin:
+        raise ApiError("forbidden", "only an admin can change provider keys")
+
+
+def _provider(name: str) -> str:
+    from app.provider_keys import PROVIDERS
+
+    if name not in PROVIDERS:
+        raise ApiError("not_found", f"no provider named {name!r}")
+    return name
+
+
+@app.get("/providers/keys")
+async def get_provider_keys(
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Where each key comes from and its last four characters. Never the key."""
+    _require_admin(who)
+    from app import provider_keys
+
+    await provider_keys.refresh(session, force=True)
+    return {"keys": provider_keys.describe(),
+            "can_save": bool(settings.provider_key_encryption_key)}
+
+
+@app.put("/providers/keys/{name}")
+async def put_provider_key(
+    name: str,
+    body: ProviderKeyBody,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Check the key with the provider, then save it encrypted. A Jina key with credit
+    also resumes the jobs that paused because Jina ran out."""
+    _require_admin(who)
+    provider = _provider(name)
+    from app import provider_keys, providers
+
+    async with httpx.AsyncClient(timeout=providers.TIMEOUT_S) as client:
+        if provider == "jina":
+            balance = await providers.jina_balance(client, body.key)
+            if balance is None:
+                raise ApiError("invalid_provider_key", "Jina did not accept this key")
+            status = providers.jina_state(balance)
+        else:
+            balance = None
+            status = await providers.typesafe_key_status(client, body.key)
+            if status == "rejected":
+                raise ApiError("invalid_provider_key", "TypeSafe did not accept this key")
+            if status == "unknown":
+                raise ApiError("invalid_provider_key", "TypeSafe could not be reached to check "
+                               "this key; try again", status=503, retry_after=30)
+    try:
+        await provider_keys.save(session, provider, body.key, who.name)
+    except provider_keys.KeyStoreUnavailable as e:
+        raise ApiError("key_store_unavailable", str(e)) from e
+    providers.reset_cache()
+    resumed = 0
+    if provider == "jina" and balance is not None and balance > 0:
+        resumed = await _resume_paused_for(session, "jina_account")
+    log.info("provider_key_saved", extra={"provider": provider, "by": who.name,
+                                          "resumed_jobs": resumed})
+    return {"provider": provider, "status": status, "balance_tokens": balance,
+            "last4": body.key[-4:], "resumed_jobs": resumed}
+
+
+@app.delete("/providers/keys/{name}")
+async def delete_provider_key(
+    name: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Forget the portal-set key; the environment's key (if any) applies again."""
+    _require_admin(who)
+    provider = _provider(name)
+    from app import provider_keys, providers
+
+    await provider_keys.clear(session, provider)
+    providers.reset_cache()
+    return {"provider": provider, **provider_keys.describe()[provider]}
+
+
+async def _resume_paused_for(session: AsyncSession, reason: str) -> int:
+    rows = (await session.execute(
+        text("""
+            UPDATE jobs SET status = 'running', pause_reason = NULL,
+                paused_seconds = paused_seconds + CASE
+                    WHEN started_at IS NOT NULL AND paused_at IS NOT NULL
+                    THEN extract(epoch FROM now() - greatest(paused_at, started_at))
+                    ELSE 0 END,
+                paused_at = NULL
+            WHERE status = 'paused' AND pause_reason = :r
+            RETURNING id
+        """),
+        {"r": reason},
+    )).all()
+    await session.commit()
+    for (job_id,) in rows:
+        await queue.complete_if_finished(session, job_id)
+    return len(rows)
+
+
 @app.get("/providers/status")
 async def providers_status(
     who: Principal = Depends(require_api_key),
@@ -570,6 +818,7 @@ async def list_jobs(
     if not who.is_admin:
         stmt = stmt.where(Job.owner_id == who.user_id)
     rows = (await session.execute(stmt)).all()
+    progress = await _list_progress(session, [j.id for j, _ in rows])
     return {
         "user": who.name,
         "all_users": who.is_admin,
@@ -577,6 +826,8 @@ async def list_jobs(
             {
                 "job_id": str(j.id),
                 "owner": owner or "admin",
+                **progress.get(j.id, {"done": 0, "unique_domains": 0, "found": 0,
+                                      "active_seconds": None}),
                 "status": j.status,
                 "pause_reason": j.pause_reason,
                 "filename": j.filename,

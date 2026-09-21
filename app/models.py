@@ -236,3 +236,18 @@ class Page(Base):
     )
 
     __table_args__ = (Index("ix_pages_domain_fetched_at", "domain", "fetched_at"),)
+
+
+class ProviderKey(Base):
+    """Jina / TypeSafe keys set from the portal; AES-GCM ciphertext (app/provider_keys.py)."""
+
+    __tablename__ = "provider_keys"
+
+    provider: Mapped[str] = mapped_column(Text, primary_key=True)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce: Mapped[str] = mapped_column(Text, nullable=False)
+    last4: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_by: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

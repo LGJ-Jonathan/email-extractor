@@ -19,6 +19,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.provider_keys import current as current_key
 from app.settings import settings
 
 CACHE_S = 300
@@ -38,34 +39,38 @@ def jina_state(balance: int | None) -> str:
     return "low" if balance < settings.jina_low_balance_tokens else "ok"
 
 
-async def _jina(client: httpx.AsyncClient) -> dict:
-    if not settings.jina_api_key:
-        return {"status": "not_configured", "balance_tokens": None}
+async def jina_balance(client: httpx.AsyncClient, key: str) -> int | None:
+    """The wallet's total balance for this key, or None if it can't be read."""
     try:
-        r = await client.get(JINA_WALLET_URL, params={"api_key": settings.jina_api_key})
+        r = await client.get(JINA_WALLET_URL, params={"api_key": key})
         wallet = (r.json() or {}).get("wallet") or {} if r.status_code == 200 else {}
         total = wallet.get("total_balance")
-        balance = int(total) if isinstance(total, (int, float)) else None
+        return int(total) if isinstance(total, (int, float)) else None
     except (httpx.HTTPError, ValueError, TypeError):
-        balance = None
+        return None
+
+
+async def typesafe_key_status(client: httpx.AsyncClient, key: str) -> str:
+    try:
+        r = await client.get(TYPESAFE_MODELS_URL, headers={"Authorization": f"Bearer {key}"})
+    except httpx.HTTPError:
+        return "unknown"
+    return {200: "ok", 401: "rejected", 403: "rejected", 402: "empty"}.get(r.status_code, "unknown")
+
+
+async def _jina(client: httpx.AsyncClient) -> dict:
+    key = current_key("jina")
+    if not key:
+        return {"status": "not_configured", "balance_tokens": None}
+    balance = await jina_balance(client, key)
     return {"status": jina_state(balance), "balance_tokens": balance}
 
 
 async def _typesafe(client: httpx.AsyncClient) -> dict:
-    if not settings.typesafe_api_key:
+    key = current_key("typesafe")
+    if not key:
         return {"status": "not_configured"}
-    try:
-        r = await client.get(TYPESAFE_MODELS_URL,
-                             headers={"Authorization": f"Bearer {settings.typesafe_api_key}"})
-    except httpx.HTTPError:
-        return {"status": "unknown"}
-    if r.status_code == 200:
-        return {"status": "ok"}
-    if r.status_code in (401, 403):
-        return {"status": "rejected"}
-    if r.status_code == 402:
-        return {"status": "empty"}
-    return {"status": "unknown"}
+    return {"status": await typesafe_key_status(client, key)}
 
 
 _USAGE = text("""
@@ -79,6 +84,9 @@ WHERE state = 'done' AND finished_at >= date_trunc('month', now())
 
 async def provider_status(session: AsyncSession) -> dict:
     global _cache
+    from app import provider_keys
+
+    await provider_keys.refresh(session)
     now = time.monotonic()
     async with _lock:
         if _cache is None or now - _cache[0] > CACHE_S:
