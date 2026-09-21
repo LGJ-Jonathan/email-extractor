@@ -1,0 +1,5 @@
+User-agent: *
+Disallow: /wp-admin/
+
+Sitemap: https://acmeroofing.com/sitemap.xml
+Sitemap: https://acmeroofing.com/page-sitemap.xml
