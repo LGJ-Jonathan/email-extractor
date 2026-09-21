@@ -63,6 +63,10 @@ services:
   worker:
     build: .
     env_file: .env
+    environment:
+      # 50 domains in flight, but each holds a connection only for short transactions.
+      DB_POOL_SIZE: "20"
+      DB_MAX_OVERFLOW: "20"
     command: ["python", "-m", "app.worker"]
     stop_grace_period: 30s
     volumes:
@@ -73,6 +77,21 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Public entry for the portal (clients.leadgenjay.com), which runs on Railway and
+  # cannot reach thor's Tailscale address. Cloudflare Access (service token) sits in
+  # front, the X-API-Key behind it. Off until TUNNEL_TOKEN is set:
+  #   docker compose --profile tunnel up -d cloudflared
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.3
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      api:
         condition: service_healthy
     restart: unless-stopped
 

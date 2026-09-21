@@ -65,9 +65,19 @@ class Settings(BaseSettings):
     retry_pass_delay_s: int = 600        # delay before re-running transient failures (spec 17)
     user_agent: str = "Mozilla/5.0 (compatible; ContactFinder/1.0)"
 
+    # Database pool, per process. The worker's domains hold a connection only for short
+    # transactions, so this need not match GLOBAL_FETCH_CONCURRENCY; API + worker must
+    # stay under Postgres max_connections (100 by default).
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
+
     # Multi-user
     max_active_jobs_per_user: int = 3    # queued + running + paused
+    rate_limit_per_minute: int = 120     # per person; status polling is exempt; 0 = off
+    max_upload_bytes: int = 50 * 1024 * 1024
     webhook_timeout_s: int = 10
+    webhook_secret: str = ""             # set to HMAC-sign deliveries
+    allow_http_webhooks: bool = False    # plain http leaks results in transit
 
     # Debug / ops
     debug_store_html: bool = False

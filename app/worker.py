@@ -21,7 +21,7 @@ from app.pipeline.fetch import ErrorClass, FetchError, build_fetcher, close_clie
 from app.pipeline.run import RETRYABLE_DOMAIN_REASONS, process_domain
 from app.schemas import DomainResult
 from app.settings import settings
-from app.webhook import deliver
+from app.webhook import WebhookSender
 
 log = logging.getLogger("email_extractor")
 
@@ -39,7 +39,7 @@ class Worker:
         self.concurrency = concurrency or settings.global_fetch_concurrency
         self.fetcher = fetcher or build_fetcher()
         self.sessions = get_sessionmaker()
-        self.in_flight: set[str] = set()
+        self.webhooks = WebhookSender()
         self._tasks: set[asyncio.Task] = set()
         self._stopping = asyncio.Event()
 
@@ -55,6 +55,7 @@ class Worker:
     async def run(self) -> None:
         log.info("worker_start", extra={"worker": self.id, "concurrency": self.concurrency})
         slots = asyncio.Semaphore(self.concurrency)
+        await self.webhooks.start()
         background = [asyncio.create_task(self._heartbeat_loop()),
                       asyncio.create_task(self._reap_loop())]
         try:
@@ -96,6 +97,7 @@ class Worker:
                 await queue.release_worker(s, self.id)
         except Exception:  # noqa: BLE001 - the reaper recovers them anyway
             log.exception("release_failed")
+        await self.webhooks.close()
         log.info("worker_stop", extra={"worker": self.id})
 
     async def _heartbeat_loop(self) -> None:
@@ -103,7 +105,7 @@ class Worker:
             await asyncio.sleep(queue.HEARTBEAT_S)
             try:
                 async with self.sessions() as s:
-                    await queue.heartbeat(s, self.id, sorted(self.in_flight))
+                    await queue.heartbeat(s, self.id)
             except Exception:  # noqa: BLE001
                 log.exception("heartbeat_failed")
 
@@ -129,8 +131,8 @@ class Worker:
             log.exception("handle_failed", extra={"domain": c.domain, "job_id": str(c.job_id)})
             try:
                 async with self.sessions() as s:
-                    await queue.unlock_domain(s, c.domain, queue.lock_token(self.id, c))
-                    await queue.requeue(s, c, self.id, ERROR_RETRY_DELAY_S)
+                    await queue.unlock_domain(s, c)
+                    await queue.requeue(s, c, ERROR_RETRY_DELAY_S)
             except Exception:  # noqa: BLE001 - the reaper will return it
                 log.exception("requeue_failed")
 
@@ -144,23 +146,23 @@ class Worker:
                 await self._finish(s, job, c, cached, from_cache=True)
                 return
             if c.attempts > MAX_CLAIMS:
+                # Not an answer about the site, so it stays in this job and never
+                # reaches the shared cache that other jobs read.
                 result = DomainResult(domain=c.domain, status="fetch_failed",
                                       error_reason="internal_error",
                                       site_status="too_many_attempts")
-                await queue.lock_domain(s, c.domain, queue.lock_token(self.id, c))
-                await self._finish(s, job, c, result, from_cache=False)
+                await self._finish(s, job, c, result, from_cache=False, write_cache=False)
                 return
-            if not await queue.lock_domain(s, c.domain, queue.lock_token(self.id, c)):
-                await queue.requeue(s, c, self.id, queue.LOCK_BUSY_DELAY_S, count_attempt=False)
+            if not await queue.lock_domain(s, c):
+                await queue.requeue(s, c, queue.LOCK_BUSY_DELAY_S, count_attempt=False)
                 return
             # The other job may have finished it between the cache check and the lock.
             cached = await queue.cached_result(s, job, c.domain)
             if cached is not None:
-                await queue.unlock_domain(s, c.domain, queue.lock_token(self.id, c))
+                await queue.unlock_domain(s, c)
                 await self._finish(s, job, c, cached, from_cache=True)
                 return
 
-        self.in_flight.add(c.domain)
         try:
             result = await process_domain(c.domain, self.fetcher)
         except FetchError as e:
@@ -170,11 +172,10 @@ class Worker:
             log.error("jobs_paused", extra={"reason": reason, "detail": str(e)})
             async with self.sessions() as s:
                 await queue.pause_active_jobs(s, reason)
-                await queue.unlock_domain(s, c.domain, queue.lock_token(self.id, c))
-                await queue.requeue(s, c, self.id, 0, count_attempt=False)
+                await queue.unlock_domain(s, c)
+                await queue.requeue(s, c, 0, count_attempt=False)
             return
         finally:
-            self.in_flight.discard(c.domain)
             gate = getattr(self.fetcher, "gate", None)
             if gate is not None:
                 gate.release_domain(c.domain)
@@ -184,29 +185,45 @@ class Worker:
                     and c.attempts < settings.max_domain_attempts):
                 # Spec 17 level 2: come back after the main pass, when the provider
                 # has had time to recover. Downloads show it as pending + retrying.
-                await queue.unlock_domain(s, c.domain, queue.lock_token(self.id, c))
-                await queue.requeue(s, c, self.id, settings.retry_pass_delay_s)
+                await queue.unlock_domain(s, c)
+                await queue.requeue(s, c, settings.retry_pass_delay_s)
                 return
             job = await s.get(Job, c.job_id)
             await self._finish(s, job, c, result, from_cache=False)
 
     async def _finish(self, s, job: Job | None, c: queue.Claim, result: DomainResult,
-                      *, from_cache: bool) -> None:
-        job_done = await queue.finish(s, c, self.id, result, from_cache=from_cache)
+                      *, from_cache: bool, write_cache: bool = True) -> None:
+        recorded, job_done = await queue.finish(s, c, result, from_cache=from_cache,
+                                                write_cache=write_cache)
+        if not recorded:
+            # Reaped while we worked and now owned by another claim: that claim
+            # records the result and sends the webhook, not this one.
+            log.warning("finish_skipped_lost_claim", extra={"domain": c.domain,
+                                                            "job_id": str(c.job_id)})
+            return
         log.info("domain_done", extra={
             "domain": c.domain, "job_id": str(c.job_id), "status": result.status,
             "from_cache": from_cache, "jina_tokens": 0 if from_cache else result.jina_tokens,
         })
         if job_done:
             log.info("job_done", extra={"job_id": str(c.job_id)})
-        if job is not None and job.webhook_url:
-            rows = await queue.row_indexes(s, c.job_id, c.domain)
-            payload = {
+        if job is None or not job.webhook_url:
+            return
+        rows = await queue.row_indexes(s, c.job_id, c.domain)
+        await self.webhooks.submit(job.webhook_url, {
+            "event": "domain.done",
+            "job_id": str(c.job_id),
+            "row_indexes": rows,
+            "result": result.model_dump(mode="json"),
+        })
+        if job_done:
+            from app.jobs import job_counts
+
+            await self.webhooks.submit(job.webhook_url, {
+                "event": "job.done",
                 "job_id": str(c.job_id),
-                "row_indexes": rows,
-                "result": result.model_dump(mode="json"),
-            }
-            self._spawn(deliver(job.webhook_url, payload))
+                "counts": await job_counts(s, c.job_id),
+            })
 
 
 async def main() -> None:

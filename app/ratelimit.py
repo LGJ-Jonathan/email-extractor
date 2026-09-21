@@ -115,7 +115,11 @@ class RedisTokenBucket:
         if self._client is None:
             import redis.asyncio as aioredis
 
-            self._client = aioredis.from_url(self._redis_url)
+            # Timeouts matter: without them a Redis that hangs (rather than refusing)
+            # blocks every acquire() forever and the local fallback never runs.
+            self._client = aioredis.from_url(
+                self._redis_url, socket_timeout=1.0, socket_connect_timeout=1.0
+            )
         if self._script is None:
             self._script = self._client.register_script(_BUCKET_LUA)
         return self._script

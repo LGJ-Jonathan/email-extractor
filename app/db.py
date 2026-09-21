@@ -24,13 +24,12 @@ def _loop_key() -> int:
 def get_engine() -> AsyncEngine:
     key = _loop_key()
     if key not in _engines:
-        # The fetch worker runs up to GLOBAL_FETCH_CONCURRENCY domains at once and each
-        # checkpoints its stage, so the pool must cover that or domains fail on
-        # pool_timeout rather than on anything real.
+        # Sized explicitly: the old max(5, concurrency/2) + concurrency gave the API
+        # and the worker 75 connections each against Postgres's default 100.
         _engines[key] = create_async_engine(
             settings.database_url,
-            pool_size=max(5, settings.global_fetch_concurrency // 2),
-            max_overflow=settings.global_fetch_concurrency,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
             pool_pre_ping=True,
             echo=False,
         )

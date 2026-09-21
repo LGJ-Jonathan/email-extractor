@@ -95,7 +95,7 @@ async def run_until(sessions, predicate, *, concurrency=4, timeout=20.0):
                 if await predicate(s):
                     return w
             await asyncio.sleep(0.2)
-        raise AssertionError("condition not reached before timeout")
+        raise AssertionError(f"condition not reached before timeout; worker: {task}")
     finally:
         w.stop()
         await task
@@ -258,7 +258,7 @@ async def test_a_worker_that_dies_has_its_rows_reaped(db):
     job = await make_job(db, ["dies.com"])
     async with db() as s:
         c = await queue.claim(s, "dead-worker")
-        assert await queue.lock_domain(s, c.domain, queue.lock_token("dead-worker", c))
+        assert await queue.lock_domain(s, c)
         assert await queue.reap(s) == 0                         # still fresh
         await s.execute(text(
             "UPDATE job_domains SET heartbeat_at = now() - interval '10 minutes'"))
@@ -268,7 +268,7 @@ async def test_a_worker_that_dies_has_its_rows_reaped(db):
         again = await queue.claim(s, "new-worker")
         assert again.domain == "dies.com" and again.attempts == 2
         # the expired lock is free to the new claim
-        assert await queue.lock_domain(s, "dies.com", queue.lock_token("new-worker", again))
+        assert await queue.lock_domain(s, again)
 
 
 async def test_a_clean_shutdown_hands_work_back_without_spending_an_attempt(db, monkeypatch):
@@ -301,12 +301,12 @@ async def test_a_worker_cannot_lock_a_domain_twice_for_two_jobs(db):
         c1 = await queue.claim(s, "w")
         c2 = await queue.claim(s, "w")
         assert c1.job_id != c2.job_id
-        assert await queue.lock_domain(s, "twice.com", queue.lock_token("w", c1))
-        assert not await queue.lock_domain(s, "twice.com", queue.lock_token("w", c2))
+        assert await queue.lock_domain(s, c1)
+        assert not await queue.lock_domain(s, c2)
         # and the loser cannot release the winner's lock
-        await queue.unlock_domain(s, "twice.com", queue.lock_token("w", c2))
+        await queue.unlock_domain(s, c2)
         owner = await s.scalar(text("SELECT lock_owner FROM domains WHERE domain = 'twice.com'"))
-        assert owner == queue.lock_token("w", c1)
+        assert owner == c1.token
 
 
 async def test_circuit_open_goes_to_the_retry_pass_and_shows_as_retrying(db, monkeypatch):
@@ -333,7 +333,7 @@ async def test_circuit_open_goes_to_the_retry_pass_and_shows_as_retrying(db, mon
 
 
 async def test_webhook_gets_each_result_with_its_row_indexes(db, monkeypatch):
-    from app import worker as worker_mod
+    from app import webhook
 
     calls: list[str] = []
     sent: list[tuple[str, dict]] = []
@@ -343,18 +343,21 @@ async def test_webhook_gets_each_result_with_its_row_indexes(db, monkeypatch):
         sent.append((url, payload))
         return True
 
-    monkeypatch.setattr(worker_mod, "deliver", capture)
+    monkeypatch.setattr(webhook, "deliver", capture)
     job = await make_job(db, ["w.com", "v.com", "www.w.com"], webhook_url="https://hook.test/x")
+    # (make_job skips the API's URL check; the address check is tested separately)
 
     async def done(s):
         return await job_status(s, job.id) == "done"
 
     await run_until(db, done)
-    await asyncio.sleep(0.1)
-    by_domain = {p["result"]["domain"]: p for _, p in sent}
+    by_domain = {p["result"]["domain"]: p for _, p in sent if p["event"] == "domain.done"}
     assert set(by_domain) == {"w.com", "v.com"}
     assert by_domain["w.com"]["row_indexes"] == [0, 2]
     assert by_domain["w.com"]["job_id"] == str(job.id)
+    finals = [p for _, p in sent if p["event"] == "job.done"]
+    assert len(finals) == 1 and finals[0]["counts"]["done"] == 2
+    assert len({p["delivery_id"] for _, p in sent}) == len(sent)
 
 
 # --- API: keys and ownership ----------------------------------------------
@@ -428,7 +431,7 @@ async def test_cancelled_jobs_are_not_claimed(db):
 
     job = await make_job(db, ["gone1.com", "gone2.com"])
     async with db() as s:
-        await s.execute(text("UPDATE jobs SET status = 'failed', pause_reason = 'cancelled'"))
+        await s.execute(text("UPDATE jobs SET status = 'cancelled'"))
         await s.commit()
         assert await queue.claim(s, "w") is None
 
@@ -465,3 +468,254 @@ def test_cache_usable_rules():
     assert not cache_usable(fresh_job, now - timedelta(days=1), "found", r)
     assert cache_usable(fresh_job, now + timedelta(seconds=1), "found", r)
     assert not cache_usable(job, None, None, None)
+
+
+# --- review fixes ----------------------------------------------------------
+
+
+async def test_a_reaped_claim_cannot_finish_the_row_again(db):
+    """A stale handler finishing after its row was reaped and reclaimed is a no-op."""
+    from app import queue
+    from app.schemas import DomainResult
+
+    await make_job(db, ["stale.com"])
+    async with db() as s:
+        old = await queue.claim(s, "w")
+        await s.execute(text("UPDATE job_domains SET heartbeat_at = now() - interval '1 hour'"))
+        await s.commit()
+        await queue.reap(s)
+        new = await queue.claim(s, "w")                   # same worker, new claim
+        assert new.token != old.token
+        r = DomainResult(domain="stale.com", status="found", best_email="a@stale.com")
+        assert await queue.finish(s, old, r, from_cache=False) == (False, False)
+        assert await s.scalar(text("SELECT state FROM job_domains")) == "running"
+        assert await s.scalar(text("SELECT finished_at FROM domains")) is None
+        recorded, done = await queue.finish(s, new, r, from_cache=False)
+        assert recorded and done
+
+
+async def test_too_many_attempts_does_not_poison_the_shared_cache(db, monkeypatch):
+    from app import worker as worker_mod
+    from app.schemas import DomainResult
+
+    async with db() as s:
+        good = DomainResult(domain="good.com", status="found", best_email="info@good.com")
+        await s.execute(text("""
+            INSERT INTO domains (domain, stage, status, result, finished_at)
+            VALUES ('good.com', 'done', 'found', CAST(:r AS jsonb), now() - interval '1 day')
+        """), {"r": good.model_dump_json()})
+        await s.commit()
+    job = await make_job(db, ["good.com"], fresh=True)
+    async with db() as s:
+        await s.execute(text("UPDATE job_domains SET attempts = 99"))
+        await s.commit()
+    monkeypatch.setattr(worker_mod, "process_domain", None)       # must not be reached
+
+    async def done(s):
+        return await job_status(s, job.id) == "done"
+
+    await run_until(db, done)
+    async with db() as s:
+        shared = await s.scalar(text("SELECT status FROM domains WHERE domain = 'good.com'"))
+        mine = await s.scalar(text("SELECT status FROM job_domains"))
+    assert shared == "found" and mine == "fetch_failed"
+
+
+async def test_a_finished_jobs_download_does_not_change_when_the_cache_does(db, monkeypatch):
+    from app.jobs import job_counts, stream_rows
+    from app.models import Job
+
+    calls: list[str] = []
+    stub_pipeline(monkeypatch, calls)
+    first = await make_job(db, ["moving.com"])
+
+    async def done(job):
+        async def pred(s):
+            return await job_status(s, job.id) == "done"
+        return pred
+
+    await run_until(db, await done(first))
+    stub_pipeline(monkeypatch, calls, status="no_contact_info")
+    second = await make_job(db, ["moving.com"], fresh=True)
+    await run_until(db, await done(second))
+
+    async with db() as s:
+        j = await s.get(Job, first.id)
+        rows = [r async for r in stream_rows(s, j)]
+        counts = await job_counts(s, first.id)
+    assert rows[0][1].status == "found" and counts["found"] == 1
+
+
+async def test_concurrent_job_creation_respects_the_limit(db, monkeypatch):
+    import httpx
+
+    from app.main import app
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "max_active_jobs_per_user", 1)
+    _, key = await make_user(db, "racer")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        rs = await asyncio.gather(*[
+            c.post("/jobs", json={"items": [f"r{i}.com"]}, headers={"X-API-Key": key})
+            for i in range(5)
+        ])
+    assert sorted(r.status_code for r in rs) == [200, 429, 429, 429, 429]
+
+
+async def test_cancel_and_resume_only_move_from_the_right_states(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    job = await make_job(db, ["st.com"])
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.post(f"/jobs/{job.id}/resume", headers=h)).status_code == 409
+        r = await c.post(f"/jobs/{job.id}/cancel", headers=h)
+        assert r.status_code == 200 and r.json()["status"] == "cancelled"
+        again = await c.post(f"/jobs/{job.id}/cancel", headers=h)
+        assert again.status_code == 409 and "cancelled" in again.json()["detail"]
+        assert (await c.post(f"/jobs/{job.id}/resume", headers=h)).status_code == 409
+
+
+async def test_downloads_do_not_leak_connections(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    job = await make_job(db, ["leak.com", "leak2.com"])
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for _ in range(5):
+            assert (await c.get(f"/jobs/{job.id}/results.csv", headers=h)).status_code == 200
+            assert (await c.get(f"/jobs/{job.id}/results.json", headers=h)).status_code == 200
+    async with db() as s:
+        stuck = await s.scalar(text(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND state = 'idle in transaction'"))
+    assert stuck == 0
+
+
+async def test_private_webhook_urls_are_refused_at_submit(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for url in ("https://127.0.0.1/x", "https://169.254.169.254/latest",
+                    "https://10.0.0.5/hook", "https://localhost/x", "http://example.com/x",
+                    "https://user:pw@example.com/x", "ftp://example.com/x"):
+            r = await c.post("/jobs", json={"items": ["a.com"], "webhook_url": url}, headers=h)
+            assert r.status_code == 422, url
+
+
+# --- service key + acting user -------------------------------------------
+
+
+async def make_service(sessions, name="portal"):
+    from app.auth import hash_key, new_key
+    from app.models import User
+
+    key = new_key()
+    async with sessions() as s:
+        s.add(User(id=uuid.uuid4(), name=name, key_hash=hash_key(key), is_service=True))
+        await s.commit()
+    return key
+
+
+async def test_service_key_acts_for_each_person_separately(db):
+    import httpx
+
+    from app.main import app
+
+    svc = await make_service(db)
+    a = {"X-API-Key": svc, "X-Acting-User": "Alice@LeadGenJay.com"}
+    b = {"X-API-Key": svc, "X-Acting-User": "bob@leadgenjay.com"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        jid = (await c.post("/jobs", json={"items": ["x.com"]}, headers=a)).json()["job_id"]
+        assert (await c.get(f"/jobs/{jid}", headers=a)).status_code == 200
+        r = await c.get(f"/jobs/{jid}", headers=b)
+        assert r.status_code == 404 and r.json()["error"]["code"] == "job_not_found"
+        mine = (await c.get("/jobs", headers=a)).json()
+        assert mine["user"] == "alice@leadgenjay.com" and len(mine["jobs"]) == 1
+        admin = {**b, "X-Acting-Role": "admin"}
+        assert (await c.get(f"/jobs/{jid}", headers=admin)).status_code == 200
+
+        r = await c.get("/jobs", headers={"X-API-Key": svc})
+        assert r.status_code == 400 and r.json()["error"]["code"] == "acting_user_required"
+        r = await c.get("/jobs", headers={"X-API-Key": svc, "X-Acting-User": "not-an-email"})
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_acting_user"
+    async with db() as s:
+        owner = await s.scalar(text(
+            "SELECT u.name FROM jobs j JOIN users u ON u.id = j.owner_id"))
+    assert owner == "alice@leadgenjay.com"
+
+
+async def test_the_job_limit_applies_per_acting_person_not_per_service_key(db, monkeypatch):
+    import httpx
+
+    from app.main import app
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "max_active_jobs_per_user", 1)
+    svc = await make_service(db)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for who in ("a@x.com", "b@x.com"):
+            r = await c.post("/jobs", json={"items": ["q.com"]},
+                             headers={"X-API-Key": svc, "X-Acting-User": who})
+            assert r.status_code == 200
+        r = await c.post("/jobs", json={"items": ["q.com"]},
+                         headers={"X-API-Key": svc, "X-Acting-User": "a@x.com"})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "job_limit_reached"
+
+
+async def test_a_personal_key_cannot_claim_to_act_for_someone(db):
+    import httpx
+
+    from app.main import app
+
+    _, key = await make_user(db, "sam")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.get("/jobs", headers={"X-API-Key": key, "X-Acting-User": "boss@x.com"})
+        assert r.status_code == 403 and r.json()["error"]["code"] == "acting_user_not_allowed"
+        r = await c.get("/jobs", headers={"X-API-Key": key, "X-Acting-Role": "admin"})
+        assert r.status_code == 403
+
+
+async def test_a_removed_person_is_refused(db):
+    import httpx
+
+    from app.main import app
+
+    svc = await make_service(db)
+    h = {"X-API-Key": svc, "X-Acting-User": "gone@x.com"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.get("/jobs", headers=h)).status_code == 200
+        async with db() as s:
+            await s.execute(text("UPDATE users SET revoked_at = now() WHERE name = 'gone@x.com'"))
+            await s.commit()
+        assert (await c.get("/jobs", headers=h)).status_code == 401
+
+
+async def test_rate_limit_per_person_exempts_polling(db, monkeypatch):
+    import fakeredis
+    import httpx
+
+    from app import auth
+    from app.main import app
+    from app.settings import settings
+
+    monkeypatch.setattr(auth, "_redis", fakeredis.FakeAsyncRedis())
+    monkeypatch.setattr(settings, "rate_limit_per_minute", 3)
+    svc = await make_service(db)
+    a = {"X-API-Key": svc, "X-Acting-User": "a@x.com"}
+    b = {"X-API-Key": svc, "X-Acting-User": "b@x.com"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for _ in range(3):
+            assert (await c.post("/extract", json={"url": "Not A Url"}, headers=a)).status_code == 200
+        r = await c.post("/extract", json={"url": "Not A Url"}, headers=a)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "rate_limited"
+        assert int(r.headers["retry-after"]) >= 1
+        assert (await c.get("/jobs", headers=a)).status_code == 200          # polling exempt
+        assert (await c.post("/extract", json={"url": "Not A Url"}, headers=b)).status_code == 200

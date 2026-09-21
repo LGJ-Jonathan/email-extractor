@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-JOB_STATUSES = ("queued", "running", "paused", "done", "failed")
+JOB_STATUSES = ("queued", "running", "paused", "done", "failed", "cancelled")
 DOMAIN_STAGES = (
     "pending",
     "dns",
@@ -46,6 +46,11 @@ class User(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     key_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     is_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # A service key (the portal) acts for the person named in X-Acting-User; those
+    # people get a keyless row of their own, named by email, created on first use.
+    is_service: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -118,6 +123,10 @@ class JobDomain(Base):
     )
     # Tokens THIS job paid for; 0 when it read someone else's result.
     jina_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # The result this job received, frozen at finish. domains.result is the shared cache
+    # and moves on; a finished job's download must not.
+    status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_job_domains_job_state_seq", "job_id", "state", "seq"),
@@ -145,7 +154,10 @@ class JobItem(Base):
     domain_source: Mapped[str | None] = mapped_column(Text, nullable=True)  # website | email
     raw_row: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    __table_args__ = (Index("ix_job_items_job_id_row_index", "job_id", "row_index"),)
+    __table_args__ = (
+        Index("ix_job_items_job_id_row_index", "job_id", "row_index"),
+        Index("ix_job_items_job_id_domain", "job_id", "domain"),
+    )
 
 
 class Domain(Base):
@@ -170,7 +182,11 @@ class Domain(Base):
     lock_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
     lock_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (Index("ix_domains_finished_at", "finished_at"),)
+    __table_args__ = (
+        Index("ix_domains_finished_at", "finished_at"),
+        Index("ix_domains_lock_owner", "lock_owner",
+              postgresql_where=text("lock_owner IS NOT NULL")),
+    )
 
 
 class Page(Base):

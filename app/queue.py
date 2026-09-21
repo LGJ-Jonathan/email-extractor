@@ -10,7 +10,8 @@ Model:
 - `claim` picks the job whose owner has the fewest domains in flight, then the job
   with the fewest, then the oldest, and takes that job's next domain with
   FOR UPDATE SKIP LOCKED. A 200-row upload therefore starts at once beside a 50k one.
-- `domains.lock_owner/lock_until` stops two jobs fetching the same domain together;
+- `domains.lock_owner/lock_until` (held by one claim) stops two jobs fetching the same
+  domain together;
   the loser requeues briefly and then reads the winner's result from the cache.
 - Workers heartbeat their running rows; `reap` returns rows whose worker went quiet.
 """
@@ -36,16 +37,18 @@ class Claim:
     job_id: uuid.UUID
     domain: str
     attempts: int       # including this one
+    token: str          # this claim alone; see new_token
 
 
-def lock_token(worker: str, c: Claim) -> str:
-    """Domain locks belong to one claim, not to the worker.
+def new_token(worker: str) -> str:
+    """Identifies one claim, not the worker.
 
-    A worker runs dozens of domains at once. Keyed by worker alone, the lock was
-    re-entrant across that worker's own claims, so two jobs sharing a domain both
-    fetched it whenever the same process claimed both.
+    A worker runs dozens of domains at once, and after a reap it can reclaim a row it
+    was still processing. Guarding writes with the worker id let that stale handler
+    finish the row a second time (double webhook, double tokens). Every write that
+    touches a claimed row or a domain lock is guarded by this token instead.
     """
-    return f"{worker}|{c.job_id}"
+    return f"{worker}|{uuid.uuid4().hex[:12]}"
 
 
 _PICK_JOBS = text("""
@@ -88,7 +91,8 @@ RETURNING jd.domain, jd.attempts
 async def claim(session: AsyncSession, worker: str) -> Claim | None:
     job_ids = [r[0] for r in await session.execute(_PICK_JOBS)]
     for job_id in job_ids:
-        row = (await session.execute(_CLAIM_FROM_JOB, {"worker": worker, "job_id": job_id})).first()
+        token = new_token(worker)
+        row = (await session.execute(_CLAIM_FROM_JOB, {"worker": token, "job_id": job_id})).first()
         if row is None:
             continue                      # another worker took the last one
         await session.execute(
@@ -96,7 +100,7 @@ async def claim(session: AsyncSession, worker: str) -> Claim | None:
             {"j": job_id},
         )
         await session.commit()
-        return Claim(job_id=job_id, domain=row[0], attempts=row[1])
+        return Claim(job_id=job_id, domain=row[0], attempts=row[1], token=token)
     await session.rollback()
     return None
 
@@ -130,7 +134,8 @@ async def cached_result(session: AsyncSession, job: Job, domain: str) -> DomainR
         return None
 
 
-async def lock_domain(session: AsyncSession, domain: str, token: str) -> bool:
+async def lock_domain(session: AsyncSession, c: Claim) -> bool:
+    domain, token = c.domain, c.token
     await session.execute(
         text("INSERT INTO domains (domain, stage) VALUES (:d, 'pending') ON CONFLICT DO NOTHING"),
         {"d": domain},
@@ -150,7 +155,8 @@ async def lock_domain(session: AsyncSession, domain: str, token: str) -> bool:
     return got is not None
 
 
-async def unlock_domain(session: AsyncSession, domain: str, token: str) -> None:
+async def unlock_domain(session: AsyncSession, c: Claim) -> None:
+    domain, token = c.domain, c.token
     await session.execute(
         text("""
             UPDATE domains SET lock_owner = NULL, lock_until = NULL,
@@ -162,7 +168,7 @@ async def unlock_domain(session: AsyncSession, domain: str, token: str) -> None:
     await session.commit()
 
 
-async def requeue(session: AsyncSession, c: Claim, worker: str, delay_s: float,
+async def requeue(session: AsyncSession, c: Claim, delay_s: float,
                   *, count_attempt: bool = True) -> None:
     """Put a claimed row back. count_attempt=False when the domain did no work."""
     await session.execute(
@@ -173,41 +179,59 @@ async def requeue(session: AsyncSession, c: Claim, worker: str, delay_s: float,
                 attempts = attempts - :refund
             WHERE job_id = :j AND domain = :d AND claimed_by = :w AND state = 'running'
         """),
-        {"j": c.job_id, "d": c.domain, "w": worker, "delay": float(delay_s),
+        {"j": c.job_id, "d": c.domain, "w": c.token, "delay": float(delay_s),
          "refund": 0 if count_attempt else 1},
     )
     await session.commit()
 
 
-async def finish(session: AsyncSession, c: Claim, worker: str, result: DomainResult,
-                 *, from_cache: bool) -> bool:
-    """Record the outcome in one transaction. Returns True if that completed the job."""
-    if not from_cache:
+async def finish(session: AsyncSession, c: Claim, result: DomainResult,
+                 *, from_cache: bool, write_cache: bool = True) -> tuple[bool, bool]:
+    """Record the outcome in one transaction.
+
+    Returns (recorded, job_done). recorded is False when this claim no longer owns the
+    row -- it was reaped and someone else has it -- and then nothing is written, so the
+    caller must not send a webhook either. write_cache=False keeps a result that is not
+    a real answer about the site (too_many_attempts) out of the shared cache.
+    """
+    payload = result.model_dump_json()
+    owned = (await session.execute(
+        text("""
+            UPDATE job_domains
+            SET state = 'done', finished_at = now(), claimed_by = NULL,
+                from_cache = :fc, jina_tokens = :tokens,
+                status = :status, result = CAST(:result AS jsonb)
+            WHERE job_id = :j AND domain = :d AND state = 'running' AND claimed_by = :tok
+            RETURNING domain
+        """),
+        {"j": c.job_id, "d": c.domain, "tok": c.token, "fc": from_cache,
+         "tokens": 0 if from_cache else result.jina_tokens,
+         "status": result.status, "result": payload},
+    )).first()
+    if owned is None:
+        await session.rollback()
+        return False, False
+    if not from_cache and write_cache:
         await session.execute(
             text("""
                 UPDATE domains
                 SET status = :status, result = CAST(:result AS jsonb), stage = 'done',
-                    finished_at = now(), updated_at = now(), attempts = attempts + 1,
-                    lock_owner = CASE WHEN lock_owner = :tok THEN NULL ELSE lock_owner END,
-                    lock_until = CASE WHEN lock_owner = :tok THEN NULL ELSE lock_until END
+                    finished_at = now(), updated_at = now(), attempts = attempts + 1
                 WHERE domain = :d
             """),
-            {"d": c.domain, "status": result.status, "result": result.model_dump_json(),
-             "tok": lock_token(worker, c)},
+            {"d": c.domain, "status": result.status, "result": payload},
         )
     await session.execute(
         text("""
-            UPDATE job_domains
-            SET state = 'done', finished_at = now(), claimed_by = NULL,
-                from_cache = :fc, jina_tokens = :tokens
-            WHERE job_id = :j AND domain = :d
+            UPDATE domains SET lock_owner = NULL, lock_until = NULL,
+                stage = CASE WHEN finished_at IS NULL THEN 'pending'::domain_stage ELSE 'done' END
+            WHERE domain = :d AND lock_owner = :tok
         """),
-        {"j": c.job_id, "d": c.domain, "fc": from_cache,
-         "tokens": 0 if from_cache else result.jina_tokens},
+        {"d": c.domain, "tok": c.token},
     )
     done = await complete_if_finished(session, c.job_id, commit=False)
     await session.commit()
-    return done
+    return True, done
 
 
 async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
@@ -219,7 +243,8 @@ async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
                 done_count = (SELECT count(*) FROM job_domains WHERE job_id = :j)
             WHERE id = :j AND status IN ('queued', 'running')
               AND NOT EXISTS (
-                  SELECT 1 FROM job_domains WHERE job_id = :j AND state <> 'done'
+                  SELECT 1 FROM job_domains
+                  WHERE job_id = :j AND state IN ('queued', 'running')
               )
             RETURNING id
         """),
@@ -242,20 +267,21 @@ async def pause_active_jobs(session: AsyncSession, reason: str) -> None:
     await session.commit()
 
 
-async def heartbeat(session: AsyncSession, worker: str, domains: list[str]) -> None:
+async def heartbeat(session: AsyncSession, worker: str) -> None:
+    """Keep this worker's claimed rows and domain locks alive."""
+    prefix = worker + "|%"
     await session.execute(
         text("UPDATE job_domains SET heartbeat_at = now() "
-             "WHERE state = 'running' AND claimed_by = :w"),
-        {"w": worker},
+             "WHERE state = 'running' AND claimed_by LIKE :p"),
+        {"p": prefix},
     )
-    if domains:
-        await session.execute(
-            text("""
-                UPDATE domains SET lock_until = now() + make_interval(secs => :lease)
-                WHERE domain = ANY(:ds) AND lock_owner LIKE :prefix
-            """),
-            {"ds": domains, "prefix": worker + "|%", "lease": LEASE_S},
-        )
+    await session.execute(
+        text("""
+            UPDATE domains SET lock_until = now() + make_interval(secs => :lease)
+            WHERE lock_owner IS NOT NULL AND lock_owner LIKE :p
+        """),
+        {"p": prefix, "lease": LEASE_S},
+    )
     await session.commit()
 
 
@@ -282,15 +308,15 @@ async def release_worker(session: AsyncSession, worker: str) -> None:
             UPDATE job_domains
             SET state = 'queued', claimed_by = NULL, heartbeat_at = NULL,
                 available_at = now(), attempts = greatest(attempts - 1, 0)
-            WHERE state = 'running' AND claimed_by = :w
+            WHERE state = 'running' AND claimed_by LIKE :prefix
         """),
-        {"w": worker},
+        {"prefix": worker + "|%"},
     )
     await session.execute(
         text("""
             UPDATE domains SET lock_owner = NULL, lock_until = NULL,
                 stage = CASE WHEN finished_at IS NULL THEN 'pending'::domain_stage ELSE 'done' END
-            WHERE lock_owner LIKE :prefix
+            WHERE lock_owner IS NOT NULL AND lock_owner LIKE :prefix
         """),
         {"prefix": worker + "|%"},
     )

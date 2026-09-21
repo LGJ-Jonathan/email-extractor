@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Iterable
@@ -23,6 +24,7 @@ from app.schemas import DomainResult
 from app.settings import settings
 
 EX_PREFIX = "ex_"
+PARSED_CACHE = 2000
 
 # Spec 8 CSV columns, minus the two that identify the row; these become ex_* columns
 # appended after the uploaded file's own columns (spec 14).
@@ -273,14 +275,13 @@ _COUNTS = text("""
 SELECT
     count(*) AS unique_domains,
     count(*) FILTER (WHERE jd.state = 'done') AS done,
-    count(*) FILTER (WHERE jd.state = 'done' AND d.status = 'found') AS found,
-    count(*) FILTER (WHERE jd.state = 'done' AND d.status = 'fetch_failed') AS failed,
+    count(*) FILTER (WHERE jd.state = 'done' AND jd.status = 'found') AS found,
+    count(*) FILTER (WHERE jd.state = 'done' AND jd.status = 'fetch_failed') AS failed,
     count(*) FILTER (WHERE jd.state = 'running') AS running,
     count(*) FILTER (WHERE jd.state = 'queued' AND jd.attempts > 0) AS retrying,
     count(*) FILTER (WHERE jd.from_cache) AS cached,
     coalesce(sum(jd.jina_tokens), 0) AS jina_tokens
 FROM job_domains jd
-LEFT JOIN domains d ON d.domain = jd.domain
 WHERE jd.job_id = :j
 """)
 
@@ -309,35 +310,38 @@ async def job_counts(session: AsyncSession, job_id: uuid.UUID) -> dict:
 async def stream_rows(session: AsyncSession, job: Job):
     """Yield (raw_row, DomainResult|None, pending_domain, retrying) in input order.
 
-    Uses a server-side cursor: buffering 50k rows plus their jsonb results before the
-    first byte defeats the point of streaming.
+    Reads the result snapshot on job_domains, never domains.result: the shared cache
+    moves on when a later job refetches, and a finished job's download must not.
+    Uses a server-side cursor: buffering 50k rows before the first byte defeats the
+    point of streaming.
     """
     stmt = (
-        select(JobItem, Domain, JobDomain.state, JobDomain.attempts)
+        select(JobItem, JobDomain.state, JobDomain.attempts, JobDomain.result)
         .outerjoin(
             JobDomain,
             (JobDomain.job_id == JobItem.job_id) & (JobDomain.domain == JobItem.domain),
         )
-        .outerjoin(Domain, Domain.domain == JobItem.domain)
         .where(JobItem.job_id == job.id)
         .order_by(JobItem.row_index)
         .execution_options(yield_per=500)
     )
-    seen_results: dict[str, DomainResult] = {}
-    async for item, domain_row, state, attempts in (await session.stream(stmt)):
+    # Bounded: rows come in row order, not domain order, so an unbounded dict kept all
+    # 50k parsed results alive for the whole download.
+    parsed: OrderedDict[str, DomainResult | None] = OrderedDict()
+    async for item, state, attempts, raw in (await session.stream(stmt)):
         result = None
-        # A domains row can hold an older result (the cache) that this job has not
-        # accepted yet, e.g. a fresh=true job. Only a done queue row is this job's answer.
-        if state == "done" and domain_row is not None and domain_row.result:
-            cached = seen_results.get(item.domain)
-            if cached is None:
+        if state == "done" and raw:
+            if item.domain in parsed:
+                parsed.move_to_end(item.domain)
+                result = parsed[item.domain]
+            else:
                 try:
-                    cached = DomainResult.model_validate(domain_row.result)
+                    result = DomainResult.model_validate(raw)
                 except Exception:  # noqa: BLE001
-                    cached = None
-                if cached is not None:
-                    seen_results[item.domain] = cached
-            result = cached
+                    result = None
+                parsed[item.domain] = result
+                if len(parsed) > PARSED_CACHE:
+                    parsed.popitem(last=False)
         if result is None and item.status == "invalid_input":
             result = DomainResult(
                 domain=item.domain or item.input_value[:255] or "-",

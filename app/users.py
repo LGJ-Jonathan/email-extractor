@@ -1,6 +1,7 @@
 """Manage API keys.
 
     python -m app.users add "Sam" [--admin]   prints the new key once
+    python -m app.users add portal --service  a key that acts for X-Acting-User
     python -m app.users list
     python -m app.users revoke "Sam"
 """
@@ -17,14 +18,16 @@ from app.db import dispose_engine, get_sessionmaker
 from app.models import User
 
 
-async def _add(name: str, admin: bool) -> None:
+async def _add(name: str, admin: bool, service: bool = False) -> None:
     key = new_key()
     async with get_sessionmaker()() as s:
         if await s.scalar(select(User).where(User.name == name)):
             raise SystemExit(f"a user named {name!r} already exists")
-        s.add(User(id=uuid.uuid4(), name=name, key_hash=hash_key(key), is_admin=admin))
+        s.add(User(id=uuid.uuid4(), name=name, key_hash=hash_key(key), is_admin=admin,
+                   is_service=service))
         await s.commit()
-    print(f"created {name}{' (admin)' if admin else ''}")
+    kind = " (service)" if service else " (admin)" if admin else ""
+    print(f"created {name}{kind}")
     print(f"key: {key}")
     print("This is the only time the key is shown.")
 
@@ -33,7 +36,8 @@ async def _list() -> None:
     async with get_sessionmaker()() as s:
         for u in await s.scalars(select(User).order_by(User.created_at)):
             state = f"revoked {u.revoked_at:%Y-%m-%d}" if u.revoked_at else "active"
-            print(f"{u.name:<24} {'admin' if u.is_admin else 'user':<6} {state}")
+            kind = "service" if u.is_service else "admin" if u.is_admin else "user"
+            print(f"{u.name:<32} {kind:<8} {state}")
 
 
 async def _revoke(name: str) -> None:
@@ -49,7 +53,7 @@ async def _revoke(name: str) -> None:
 async def _main(args: argparse.Namespace) -> None:
     try:
         if args.cmd == "add":
-            await _add(args.name, args.admin)
+            await _add(args.name, args.admin, args.service)
         elif args.cmd == "list":
             await _list()
         else:
@@ -64,6 +68,8 @@ def main() -> None:
     a = sub.add_parser("add")
     a.add_argument("name")
     a.add_argument("--admin", action="store_true")
+    a.add_argument("--service", action="store_true",
+                   help="acts for the person in X-Acting-User (the portal)")
     sub.add_parser("list")
     r = sub.add_parser("revoke")
     r.add_argument("name")

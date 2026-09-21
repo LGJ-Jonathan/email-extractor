@@ -35,7 +35,14 @@ _EMAILISH = re.compile(r"^[^@\s]+@[^@\s]+\.[a-z]{2,24}$", re.I)
 
 
 class IngestError(ValueError):
-    pass
+    """`code` is the API error code (app/errors.py) this failure is reported as."""
+
+    def __init__(self, message: str, code: str = "invalid_file") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+ALLOWED_EXTENSIONS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm")
 
 
 @dataclass
@@ -104,7 +111,16 @@ def parse_bytes(raw: bytes, filename: str = "") -> ParsedFile:
     if len(raw) > MAX_BYTES:
         mb = 1024 * 1024
         raise IngestError(
-            f"file is {len(raw) / mb:.1f} MB, limit is {MAX_BYTES // mb} MB"
+            f"file is {len(raw) / mb:.1f} MB, limit is {MAX_BYTES // mb} MB",
+            "file_too_large",
+        )
+    name = filename.lower()
+    if name.endswith(".xls"):
+        raise IngestError("old .xls files are not supported; save as .xlsx or .csv",
+                          "unsupported_file_type")
+    if "." in name.rsplit("/", 1)[-1] and not name.endswith(ALLOWED_EXTENSIONS):
+        raise IngestError(
+            f"{filename} is not a CSV, TSV, TXT or XLSX file", "unsupported_file_type"
         )
 
     if filename.lower().endswith((".xlsx", ".xlsm")):
@@ -116,7 +132,7 @@ def parse_bytes(raw: bytes, filename: str = "") -> ParsedFile:
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     records = list(reader)
     if not records:
-        raise IngestError("file is empty")
+        raise IngestError("file is empty", "empty_file")
 
     first = [c.strip() for c in records[0]]
     had_header = looks_like_header(first)
@@ -129,7 +145,7 @@ def parse_bytes(raw: bytes, filename: str = "") -> ParsedFile:
 
     rows = [_to_row(headers, rec) for rec in body[:MAX_ROWS]]
     if len(body) > MAX_ROWS:
-        raise IngestError(f"{len(body):,} data rows, limit is {MAX_ROWS:,}")
+        raise IngestError(f"{len(body):,} data rows, limit is {MAX_ROWS:,}", "too_many_rows")
     return ParsedFile(headers, rows, had_header, delimiter, encoding)
 
 
@@ -146,15 +162,21 @@ def _parse_xlsx(raw: bytes) -> ParsedFile:
     except ImportError as e:  # pragma: no cover
         raise IngestError("xlsx support requires openpyxl") from e
 
-    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:  # noqa: BLE001 - corrupt zip, not a workbook, encrypted
+        raise IngestError("the spreadsheet could not be opened; re-save it as .xlsx or .csv",
+                          "invalid_file") from e
     ws = wb[wb.sheetnames[0]]
-    records = [
-        ["" if c is None else str(c).strip() for c in row]
-        for row in ws.iter_rows(values_only=True)
-    ]
+    # Stop one past the cap: a small .xlsx can expand to millions of rows.
+    records = []
+    for row in ws.iter_rows(values_only=True):
+        records.append(["" if c is None else str(c).strip() for c in row])
+        if len(records) > MAX_ROWS + 1:
+            break
     wb.close()
     if not records:
-        raise IngestError("spreadsheet is empty")
+        raise IngestError("spreadsheet is empty", "empty_file")
     first = records[0]
     had_header = looks_like_header(first)
     headers = (
@@ -163,7 +185,7 @@ def _parse_xlsx(raw: bytes) -> ParsedFile:
     )
     body = records[1:] if had_header else records
     if len(body) > MAX_ROWS:
-        raise IngestError(f"{len(body):,} data rows, limit is {MAX_ROWS:,}")
+        raise IngestError(f"{len(body):,} data rows, limit is {MAX_ROWS:,}", "too_many_rows")
     return ParsedFile(headers, [_to_row(headers, r) for r in body], had_header, ",", "xlsx")
 
 

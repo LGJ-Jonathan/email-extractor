@@ -4,10 +4,13 @@ import os
 
 import pytest
 
-TEST_API_KEY = "test-api-key-not-a-secret"
+TEST_API_KEY = "test-api-key-not-a-secret-0123456789"   # >= 32 chars, like a real one
 
 # Must be set before app.settings is imported anywhere, since Settings() is module-level.
 os.environ["API_KEY"] = TEST_API_KEY
+# Nothing listens here: the per-person rate limit fails open at once instead of
+# waiting on a DNS lookup for the compose hostname "redis".
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
 
 
 @pytest.fixture(autouse=True)
