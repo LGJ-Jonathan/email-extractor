@@ -378,3 +378,41 @@ def test_environment_key_is_the_fallback(monkeypatch):
     monkeypatch.setattr(settings, "jina_api_key", "env_jina_key_abcd")
     assert pk.current("jina") == "env_jina_key_abcd" and pk.source("jina") == "environment"
     assert pk.describe()["jina"]["last4"] == "abcd"
+
+
+# --- secrets never reach the logs --------------------------------------------
+
+
+@respx.mock
+async def test_the_jina_key_never_reaches_the_logs(caplog):
+    import logging
+
+    from app import providers
+    from app.logsetup import configure
+
+    configure("INFO")
+    respx.get(providers.JINA_WALLET_URL).mock(return_value=httpx.Response(200, json={"wallet": {"total_balance": 1}}))
+    caplog.set_level(logging.INFO)
+    async with httpx.AsyncClient() as c:
+        await providers.jina_balance(c, "jina_SUPERSECRET_1234567890")
+    assert "jina_SUPERSECRET_1234567890" not in caplog.text
+    assert logging.getLogger("httpx").level >= logging.WARNING
+
+
+def test_redaction_masks_credentials_anywhere():
+    from app.logsetup import redact
+
+    line = 'GET https://x/api?api_key=jina_abc123&x=1 "Authorization: Bearer ts_live_abcdefghij"'
+    out = redact(line)
+    assert "jina_abc123" not in out and "ts_live_abcdefghij" not in out
+    assert "api_key=[redacted]" in out and "x=1" in out
+
+
+def test_redaction_filter_rewrites_records():
+    import logging
+
+    from app.logsetup import RedactSecrets
+
+    rec = logging.LogRecord("t", logging.INFO, __file__, 1, "calling %s", ("https://h/?api_key=SECRET999",), None)
+    RedactSecrets().filter(rec)
+    assert "SECRET999" not in rec.getMessage()

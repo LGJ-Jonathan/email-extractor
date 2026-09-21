@@ -29,7 +29,9 @@ from app.settings import settings
 from app.upload_page import UPLOAD_PAGE
 from app.webhook import WebhookRejected, validate_webhook_url
 
-logging.basicConfig(level=settings.log_level)
+from app.logsetup import configure as configure_logging
+
+configure_logging(settings.log_level)
 log = logging.getLogger("email_extractor")
 
 

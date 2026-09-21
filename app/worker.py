@@ -262,7 +262,9 @@ class Worker:
 
 
 async def main() -> None:
-    logging.basicConfig(level=settings.log_level)
+    from app.logsetup import configure as configure_logging
+
+    configure_logging(settings.log_level)
     worker = Worker()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
