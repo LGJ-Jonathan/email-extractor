@@ -3,8 +3,8 @@
 set -e
 case "${ROLE:-api}" in
   api)
-    # "::" so Railway's private network (IPv6) reaches it; on Linux it also takes IPv4.
-    exec uvicorn app.main:app --host "${HOST:-::}" --port "${PORT:-8000}" --proxy-headers
+    # One dual-stack socket: IPv4 for health checks, IPv6 for Railway's private network.
+    exec python -m app.serve
     ;;
   worker)
     exec python -m app.worker
