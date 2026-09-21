@@ -84,6 +84,7 @@ class Job(Base):
     columns: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     website_column: Mapped[str | None] = mapped_column(Text, nullable=True)
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Null for jobs created with the bootstrap API_KEY.
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

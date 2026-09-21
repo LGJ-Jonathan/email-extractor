@@ -259,7 +259,7 @@ async def pause_active_jobs(session: AsyncSession, reason: str) -> None:
     """Provider account errors (spec 17 level 3). The key is shared, so every job stops."""
     await session.execute(
         text("""
-            UPDATE jobs SET status = 'paused', pause_reason = :r
+            UPDATE jobs SET status = 'paused', pause_reason = :r, paused_at = now()
             WHERE status IN ('queued', 'running')
         """),
         {"r": reason},

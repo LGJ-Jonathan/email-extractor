@@ -163,3 +163,15 @@ def test_success_responses_carry_a_request_id_too():
 def test_every_code_has_a_status_and_description():
     for code, (status, when) in ERROR_CODES.items():
         assert 400 <= status < 600 and when, code
+
+
+def test_preview_follows_a_chosen_column(api_key):
+    csv_ = b"Name,Website,Email\nAcme,acme.com,mike@other.com\nBob,bob.com,x@y.com\n"
+    r = client.post("/jobs/preview", files={"file": ("x.csv", csv_, "text/csv")},
+                    data={"column": "Name"}, headers=h(api_key))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["column"] == "Name" and body["detected_column"] == "Website"
+    assert all(s["status"] == "invalid_input" for s in body["samples"])
+    check(client.post("/jobs/preview", files={"file": ("x.csv", csv_, "text/csv")},
+                      data={"column": "Nope"}, headers=h(api_key)), 422, "unknown_column")

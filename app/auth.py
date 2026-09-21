@@ -29,7 +29,7 @@ _EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,189}\.[A-Za-z]{2,24}$")
 
 # Status polling is exempt from the rate limit: the portal polls every few seconds per
 # open job, and counting that would lock people out for watching their own progress.
-_UNLIMITED = re.compile(r"^/jobs(/[^/]+)?$")
+_UNLIMITED = re.compile(r"^/jobs(/[^/]+(/recent)?)?$")
 
 
 @dataclass(frozen=True)

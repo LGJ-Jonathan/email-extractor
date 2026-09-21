@@ -279,12 +279,17 @@ def normalize_column(
     return out
 
 
-def preview(parsed: ParsedFile, guess: ColumnGuess, samples: int = 5) -> dict:
-    """The payload POST /jobs/preview returns (spec 5)."""
-    column = guess.column or guess.email_column
-    normalized = normalize_column(
-        parsed, column, derive_from_email=guess.method == "email"
-    ) if column else []
+def preview(parsed: ParsedFile, guess: ColumnGuess, samples: int = 5,
+            column: str | None = None) -> dict:
+    """The payload POST /jobs/preview returns (spec 5).
+
+    `column` previews a column the person picked instead of the detected one, so the
+    sample table and counts follow the choice before a job starts. Domains are derived
+    from emails under the same rule create_job uses: only for the offered email column.
+    """
+    column = column or guess.column or guess.email_column
+    derive = guess.method == "email" and column == guess.email_column
+    normalized = normalize_column(parsed, column, derive_from_email=derive) if column else []
 
     domains = [n.domain for n in normalized if n.ok]
     empties = sum(1 for n in normalized if n.reason == "empty")
@@ -298,6 +303,8 @@ def preview(parsed: ParsedFile, guess: ColumnGuess, samples: int = 5) -> dict:
         })
 
     return {
+        "column": column,
+        "derived_from_email": derive,
         "detected_column": guess.column,
         "confidence": guess.confidence,
         "method": guess.method,

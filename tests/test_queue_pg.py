@@ -719,3 +719,65 @@ async def test_rate_limit_per_person_exempts_polling(db, monkeypatch):
         assert int(r.headers["retry-after"]) >= 1
         assert (await c.get("/jobs", headers=a)).status_code == 200          # polling exempt
         assert (await c.post("/extract", json={"url": "Not A Url"}, headers=b)).status_code == 200
+
+
+# --- data for the job screens ---------------------------------------------
+
+
+async def test_job_detail_has_the_breakdown_the_page_shows(db, monkeypatch, api_key):
+    import httpx
+
+    from app import worker as worker_mod
+    from app.main import app
+    from app.schemas import DomainResult
+
+    outcomes = {
+        "a.com": DomainResult(domain="a.com", status="found", best_email="x@a.com",
+                              needs_review=True, phones=["+15550000000"],
+                              socials={"linkedin": "https://linkedin.com/company/a"},
+                              typesafe_called=True, jina_tokens=300,
+                              pages_fetched=["https://a.com/", "https://a.com/contact"]),
+        "b.com": DomainResult(domain="b.com", status="form_only",
+                              contact_form_url="https://b.com/contact", jina_tokens=100),
+        "c.com": DomainResult(domain="c.com", status="fetch_failed", error_reason="blocked"),
+    }
+
+    async def fake(domain, fetcher=None):
+        return outcomes[domain]
+
+    monkeypatch.setattr(worker_mod, "process_domain", fake)
+    job = await make_job(db, ["a.com", "b.com", "c.com", "", "not a url"])
+
+    async def done(s):
+        return await job_status(s, job.id) == "done"
+
+    await run_until(db, done)
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        d = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+        recent = (await c.get(f"/jobs/{job.id}/recent?limit=2", headers=h)).json()["domains"]
+    assert d["by_status"] == {"found": 1, "form_only": 1, "fetch_failed": 1}
+    assert d["needs_review"] == 1 and d["typesafe_calls"] == 1
+    assert d["captured"] == {"phones": 1, "contact_forms": 1, "linkedin": 1}
+    assert d["invalid_rows"] == 2 and d["empty_rows"] == 1 and d["total"] == 5
+    assert d["tokens_per_domain"] == 200 and d["paused_at"] is None
+    assert len(recent) == 2 and {"domain", "status", "best_email", "pages"} <= set(recent[0])
+    a = next((r for r in recent if r["domain"] == "a.com"), None)
+    if a:
+        assert a["pages"] == 2 and a["needs_review"] is True
+
+
+async def test_pausing_records_when_and_resuming_clears_it(db, api_key):
+    import httpx
+
+    from app import queue
+    from app.main import app
+
+    job = await make_job(db, ["p1.com"])
+    async with db() as s:
+        await queue.pause_active_jobs(s, "jina_account")
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.get(f"/jobs/{job.id}", headers=h)).json()["paused_at"]
+        await c.post(f"/jobs/{job.id}/resume", headers=h)
+        assert (await c.get(f"/jobs/{job.id}", headers=h)).json()["paused_at"] is None

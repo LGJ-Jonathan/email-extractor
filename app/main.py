@@ -170,15 +170,23 @@ async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
 
 
 @app.post("/jobs/preview", dependencies=[Depends(require_api_key)])
-async def jobs_preview(file: UploadFile = File(...)) -> dict:
-    """Spec 5: detect the website column and describe the file. Creates no job."""
+async def jobs_preview(
+    file: UploadFile = File(...), column: str | None = Form(default=None)
+) -> dict:
+    """Spec 5: detect the website column and describe the file. Creates no job.
+
+    Pass `column` to preview a different column than the detected one.
+    """
     raw, filename = await _read_upload(file)
     try:
         parsed = parse_bytes(raw, filename)
     except IngestError as e:
         raise ApiError(e.code, str(e)) from e
+    if column and column not in parsed.headers:
+        raise ApiError("unknown_column", f"the file has no column named {column!r}",
+                       details={"columns": parsed.headers})
     guess = detect_column(parsed)
-    return {"filename": filename, **preview(parsed, guess)}
+    return {"filename": filename, **preview(parsed, guess, column=column)}
 
 
 @app.post("/jobs")
@@ -306,8 +314,38 @@ async def get_job(
         "filename": job.filename,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "paused_at": job.paused_at.isoformat() if job.paused_at else None,
         **counts,
     }
+
+
+@app.get("/jobs/{job_id}/recent")
+async def recent_domains(
+    job_id: str,
+    limit: int = 8,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """The job's most recently finished domains, newest first (the Running screen)."""
+    job = await _get_job(session, job_id, who)
+    rows = await session.execute(
+        text("""
+            SELECT domain, status, from_cache, finished_at,
+                   result->>'best_email' AS best_email,
+                   (result->>'needs_review')::boolean AS needs_review,
+                   result->>'error_reason' AS error_reason,
+                   jsonb_array_length(coalesce(result->'pages_fetched', '[]'::jsonb)) AS pages
+            FROM job_domains
+            WHERE job_id = :j AND state = 'done'
+            ORDER BY finished_at DESC
+            LIMIT :n
+        """),
+        {"j": job.id, "n": max(1, min(limit, 50))},
+    )
+    return {"domains": [
+        {**dict(r._mapping), "finished_at": r.finished_at.isoformat() if r.finished_at else None}
+        for r in rows
+    ]}
 
 
 @app.get("/jobs/{job_id}/results.csv")
@@ -370,7 +408,8 @@ async def _transition(session: AsyncSession, job: Job, allowed: tuple[str, ...],
     """
     row = (await session.execute(
         text("""
-            UPDATE jobs SET status = CAST(:new AS job_status), pause_reason = :reason
+            UPDATE jobs SET status = CAST(:new AS job_status), pause_reason = :reason,
+                paused_at = NULL
             WHERE id = :j AND status::text = ANY(:allowed)
             RETURNING status::text
         """),

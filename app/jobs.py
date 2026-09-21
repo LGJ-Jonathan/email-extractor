@@ -280,21 +280,51 @@ SELECT
     count(*) FILTER (WHERE jd.state = 'running') AS running,
     count(*) FILTER (WHERE jd.state = 'queued' AND jd.attempts > 0) AS retrying,
     count(*) FILTER (WHERE jd.from_cache) AS cached,
-    coalesce(sum(jd.jina_tokens), 0) AS jina_tokens
+    coalesce(sum(jd.jina_tokens), 0) AS jina_tokens,
+    count(*) FILTER (WHERE jd.state = 'done' AND NOT jd.from_cache
+                     AND jd.jina_tokens > 0) AS fetched,
+    count(*) FILTER (WHERE (jd.result->>'needs_review')::boolean) AS needs_review,
+    count(*) FILTER (WHERE NOT jd.from_cache
+                     AND (jd.result->>'typesafe_called')::boolean) AS typesafe_calls,
+    count(*) FILTER (WHERE jsonb_array_length(coalesce(jd.result->'phones', '[]'::jsonb)) > 0)
+        AS with_phone,
+    count(*) FILTER (WHERE jd.result->>'contact_form_url' IS NOT NULL) AS with_form,
+    count(*) FILTER (WHERE jd.result->'socials'->>'linkedin' IS NOT NULL) AS with_linkedin
 FROM job_domains jd
 WHERE jd.job_id = :j
+""")
+
+_BY_STATUS = text("""
+SELECT jd.status, count(*) FROM job_domains jd
+WHERE jd.job_id = :j AND jd.state = 'done' AND jd.status IS NOT NULL
+GROUP BY jd.status
+""")
+
+_ROWS = text("""
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE status = 'invalid_input') AS invalid,
+       count(*) FILTER (WHERE reason = 'empty') AS empty
+FROM job_items WHERE job_id = :j
 """)
 
 
 async def job_counts(session: AsyncSession, job_id: uuid.UUID) -> dict:
     """Aggregate from Postgres, not Redis: a Redis restart must not zero the endpoint."""
-    total = await session.scalar(
-        select(func.count()).select_from(JobItem).where(JobItem.job_id == job_id)
-    )
+    rows = (await session.execute(_ROWS, {"j": job_id})).mappings().one()
     r = (await session.execute(_COUNTS, {"j": job_id})).mappings().one()
+    by_status = {k: v for k, v in (await session.execute(_BY_STATUS, {"j": job_id})).all()}
     done, found = r["done"] or 0, r["found"] or 0
+    fetched = r["fetched"] or 0
     return {
-        "total": total or 0,
+        "total": rows["total"] or 0,
+        "invalid_rows": rows["invalid"] or 0,
+        "empty_rows": rows["empty"] or 0,
+        "by_status": by_status,
+        "needs_review": r["needs_review"] or 0,
+        "typesafe_calls": r["typesafe_calls"] or 0,
+        "tokens_per_domain": round((r["jina_tokens"] or 0) / fetched) if fetched else 0,
+        "captured": {"phones": r["with_phone"] or 0, "contact_forms": r["with_form"] or 0,
+                     "linkedin": r["with_linkedin"] or 0},
         "unique_domains": r["unique_domains"] or 0,
         "done": done,
         "running": r["running"] or 0,
