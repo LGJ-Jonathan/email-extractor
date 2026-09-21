@@ -6,7 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import pydantic
-from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +18,7 @@ from app.auth import Principal, admin_key_usable, require_api_key
 from app.errors import ApiError
 from app.db import dispose_engine, get_session, get_sessionmaker
 from app.ingest import IngestError, detect_column, parse_bytes, preview
-from app.models import Job
+from app.models import Job, User
 from app.pipeline.fetch import ErrorClass, FetchError, build_fetcher
 from app.pipeline.run import process_input
 from app.schemas import MAX_ITEMS_PER_JOB, CreateJobRequest, DomainResult, ExtractRequest
@@ -63,8 +63,13 @@ errors.install(app)
 BODY_LIMIT = settings.max_upload_bytes + 1024 * 1024
 
 
-class _BodyTooLarge(Exception):
-    pass
+class _BodyTooLarge(ApiError):
+    """An ApiError, so FastAPI's form parser re-raises it (as a 413) instead of turning
+    it into a generic 400 "error parsing the body"."""
+
+    def __init__(self) -> None:
+        mb = settings.max_upload_bytes // (1024 * 1024)
+        super().__init__("file_too_large", f"request body is over the {mb} MB limit")
 
 
 class BodySizeLimit:
@@ -105,6 +110,8 @@ class BodySizeLimit:
         try:
             await self.app(scope, limited_receive, tracking_send)
         except _BodyTooLarge:
+            # Normally the app's own ApiError handler already answered 413; this covers
+            # a raise from somewhere outside it.
             if not started:
                 await self._reject(send, scope)
 
@@ -189,11 +196,31 @@ async def jobs_preview(
     return {"filename": filename, **preview(parsed, guess, column=column)}
 
 
+IDEMPOTENCY_KEY_MAX = 200
+
+
+async def _replay(session: AsyncSession, who: Principal, key: str) -> dict | None:
+    """The response of the job this person already created with this key, if any."""
+    job = await session.scalar(
+        select(Job).where(
+            Job.idempotency_key == key,
+            Job.owner_id.is_(None) if who.user_id is None else Job.owner_id == who.user_id,
+        )
+    )
+    if job is None:
+        return None
+    counts = await jobs_svc.job_counts(session, job.id)
+    return {"job_id": str(job.id), "total": counts["total"],
+            "unique_domains": counts["unique_domains"], "cached": counts["cached"],
+            "queued": counts["unique_domains"] - counts["cached"], "replayed": True}
+
+
 @app.post("/jobs")
 async def create_job(
     request: Request,
     who: Principal = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     file: UploadFile | None = File(default=None),
     column: str | None = Form(default=None),
     webhook_url: str | None = Form(default=None),
@@ -249,12 +276,21 @@ async def create_job(
         await validate_webhook_url(webhook_url)
     except WebhookRejected as e:
         raise ApiError("invalid_webhook_url", str(e)) from e
+    if idempotency_key is not None and not (0 < len(idempotency_key) <= IDEMPOTENCY_KEY_MAX):
+        raise ApiError("validation_error", "Idempotency-Key must be 1-200 characters",
+                       details=[{"field": "Idempotency-Key", "msg": "bad length"}])
+    # Serialise this person's job creation, so two simultaneous POSTs cannot both pass
+    # the job limit, and a retried POST finds the job its first attempt made. Released
+    # when create_job commits.
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"jobs:{who.user_id}"}
+    )
+    if idempotency_key:
+        replay = await _replay(session, who, idempotency_key)
+        if replay is not None:
+            await session.rollback()
+            return replay
     if not who.is_admin:
-        # Serialise this user's job creation, so two simultaneous POSTs cannot both
-        # pass the count. Released when create_job commits.
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"jobs:{who.user_id}"}
-        )
         active = await session.scalar(
             select(func.count()).select_from(Job).where(
                 Job.owner_id == who.user_id, Job.status.in_(ACTIVE_STATUSES)
@@ -276,6 +312,7 @@ async def create_job(
         webhook_url=webhook_url,
         fresh=fresh,
         owner_id=who.user_id,
+        idempotency_key=idempotency_key,
     )
     return {
         "job_id": str(job.id),
@@ -315,8 +352,26 @@ async def get_job(
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "paused_at": job.paused_at.isoformat() if job.paused_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "active_seconds": await _active_seconds(session, job.id),
+        "columns": list(job.columns or ["website"]),
         **counts,
     }
+
+
+async def _active_seconds(session: AsyncSession, job_id) -> float | None:
+    """Time the job has spent able to run: first claim to finish (or now), minus pauses.
+    Time left and "took" come from this, so a night spent paused is not counted."""
+    value = await session.scalar(
+        text("""
+            SELECT extract(epoch FROM coalesce(finished_at, now()) - started_at)
+                   - paused_seconds
+                   - coalesce(extract(epoch FROM now() - paused_at), 0)
+            FROM jobs WHERE id = :j AND started_at IS NOT NULL
+        """),
+        {"j": job_id},
+    )
+    return None if value is None else max(0.0, float(value))
 
 
 @app.get("/jobs/{job_id}/recent")
@@ -409,6 +464,8 @@ async def _transition(session: AsyncSession, job: Job, allowed: tuple[str, ...],
     row = (await session.execute(
         text("""
             UPDATE jobs SET status = CAST(:new AS job_status), pause_reason = :reason,
+                paused_seconds = paused_seconds + coalesce(
+                    extract(epoch FROM now() - paused_at), 0),
                 paused_at = NULL
             WHERE id = :j AND status::text = ANY(:allowed)
             RETURNING status::text
@@ -462,15 +519,22 @@ async def list_jobs(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """The caller's 50 most recent jobs (an admin sees everyone's)."""
-    stmt = select(Job).order_by(Job.created_at.desc()).limit(50)
+    stmt = (
+        select(Job, User.name)
+        .outerjoin(User, User.id == Job.owner_id)
+        .order_by(Job.created_at.desc())
+        .limit(50)
+    )
     if not who.is_admin:
         stmt = stmt.where(Job.owner_id == who.user_id)
-    jobs = list(await session.scalars(stmt))
+    rows = (await session.execute(stmt)).all()
     return {
         "user": who.name,
+        "all_users": who.is_admin,
         "jobs": [
             {
                 "job_id": str(j.id),
+                "owner": owner or "admin",
                 "status": j.status,
                 "pause_reason": j.pause_reason,
                 "filename": j.filename,
@@ -478,6 +542,6 @@ async def list_jobs(
                 "created_at": j.created_at.isoformat() if j.created_at else None,
                 "finished_at": j.finished_at.isoformat() if j.finished_at else None,
             }
-            for j in jobs
+            for j, owner in rows
         ],
     }

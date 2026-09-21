@@ -695,7 +695,8 @@ async def test_a_removed_person_is_refused(db):
         async with db() as s:
             await s.execute(text("UPDATE users SET revoked_at = now() WHERE name = 'gone@x.com'"))
             await s.commit()
-        assert (await c.get("/jobs", headers=h)).status_code == 401
+        r = await c.get("/jobs", headers=h)
+        assert r.status_code == 403 and r.json()["error"]["code"] == "acting_user_revoked"
 
 
 async def test_rate_limit_per_person_exempts_polling(db, monkeypatch):
@@ -781,3 +782,89 @@ async def test_pausing_records_when_and_resuming_clears_it(db, api_key):
         assert (await c.get(f"/jobs/{job.id}", headers=h)).json()["paused_at"]
         await c.post(f"/jobs/{job.id}/resume", headers=h)
         assert (await c.get(f"/jobs/{job.id}", headers=h)).json()["paused_at"] is None
+
+
+# --- second review pass ----------------------------------------------------
+
+
+async def test_a_retried_create_with_the_same_idempotency_key_returns_the_first_job(db):
+    import httpx
+
+    from app.main import app
+
+    svc = await make_service(db)
+    h = {"X-API-Key": svc, "X-Acting-User": "a@x.com", "Idempotency-Key": "upload-123"}
+    other = {"X-API-Key": svc, "X-Acting-User": "b@x.com", "Idempotency-Key": "upload-123"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        rs = await asyncio.gather(*[
+            c.post("/jobs", json={"items": ["i1.com", "i2.com"]}, headers=h) for _ in range(3)
+        ])
+        assert all(r.status_code == 200 for r in rs)
+        assert len({r.json()["job_id"] for r in rs}) == 1
+        assert sum(1 for r in rs if r.json().get("replayed")) == 2
+        # the same key from someone else is a different job
+        r = await c.post("/jobs", json={"items": ["i1.com"]}, headers=other)
+        assert r.json()["job_id"] != rs[0].json()["job_id"]
+    async with db() as s:
+        assert await s.scalar(text("SELECT count(*) FROM jobs")) == 2
+
+
+async def test_active_time_excludes_pauses(db, api_key):
+    import httpx
+
+    from app import queue
+    from app.main import app
+
+    job = await make_job(db, ["t1.com", "t2.com"])
+    async with db() as s:
+        await queue.claim(s, "w")                       # sets started_at
+        await s.execute(text(
+            "UPDATE jobs SET started_at = now() - interval '2 hours', "
+            "paused_seconds = 3600"))
+        await s.commit()
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        d = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+        assert 3590 < d["active_seconds"] < 3700
+        assert d["columns"] == ["website"]
+        async with db() as s:
+            await queue.pause_active_jobs(s, "jina_account")
+            await s.execute(text("UPDATE jobs SET paused_at = now() - interval '30 minutes'"))
+            await s.commit()
+        d = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+        assert 1790 < d["active_seconds"] < 1900          # the running pause is excluded
+        await c.post(f"/jobs/{job.id}/resume", headers=h)
+    async with db() as s:
+        assert 5390 < await s.scalar(text("SELECT paused_seconds FROM jobs")) < 5500
+
+
+async def test_admin_job_list_names_the_owner(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    uid, _ = await make_user(db, "sam")
+    await make_job(db, ["o1.com"], owner=uid)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/jobs", headers={"X-API-Key": api_key})).json()
+    assert body["all_users"] is True and body["jobs"][0]["owner"] == "sam"
+
+
+async def test_worker_stops_promptly_when_every_slot_is_busy(db, monkeypatch):
+    from app.worker import Worker
+
+    calls: list[str] = []
+    stub_pipeline(monkeypatch, calls, delay=60)
+    await make_job(db, [f"busy{i}.com" for i in range(3)])
+    w = Worker(concurrency=2, fetcher=object())
+    task = asyncio.create_task(w.run())
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if len(calls) >= 2:
+            break
+    assert len(calls) == 2                               # both slots busy, one queued
+    w.stop()
+    await asyncio.wait_for(task, 5)                      # not the 60 s a domain takes
+    async with db() as s:
+        running = await s.scalar(text("SELECT count(*) FROM job_domains WHERE state='running'"))
+    assert running == 0 and len(calls) == 2              # nothing new claimed after stop

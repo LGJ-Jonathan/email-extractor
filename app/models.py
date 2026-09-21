@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -85,6 +86,10 @@ class Job(Base):
     website_column: Mapped[str | None] = mapped_column(Text, nullable=True)
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0,
+                                                  server_default="0")
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Null for jobs created with the bootstrap API_KEY.
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -93,7 +98,12 @@ class Job(Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
-    __table_args__ = (Index("ix_jobs_owner_id_created_at", "owner_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_jobs_owner_id_created_at", "owner_id", "created_at"),
+        Index("ux_jobs_owner_idempotency", text("coalesce(owner_id::text, 'admin')"),
+              "idempotency_key", unique=True,
+              postgresql_where=text("idempotency_key IS NOT NULL")),
+    )
 
 
 class JobDomain(Base):
@@ -128,9 +138,23 @@ class JobDomain(Base):
     # and moves on; a finished job's download must not.
     status: Mapped[str | None] = mapped_column(Text, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Copied out of result at finish, so the job screens count them without
+    # reading 50k jsonb documents per poll.
+    needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                               server_default="false")
+    typesafe_called: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                                  server_default="false")
+    has_phone: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                            server_default="false")
+    has_form: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                           server_default="false")
+    has_linkedin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                               server_default="false")
 
     __table_args__ = (
         Index("ix_job_domains_job_state_seq", "job_id", "state", "seq"),
+        Index("ix_job_domains_done_recent", "job_id", text("finished_at DESC"),
+              postgresql_where=text("state = 'done'")),
         Index("ix_job_domains_running", "claimed_by", postgresql_where=text("state = 'running'")),
     )
 

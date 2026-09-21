@@ -60,7 +60,12 @@ class Worker:
                       asyncio.create_task(self._reap_loop())]
         try:
             while not self._stopping.is_set():
-                await slots.acquire()
+                # Wait for a slot OR the stop signal. A bare acquire() slept through
+                # SIGTERM while all slots were busy (up to domain_timeout_s), past
+                # Railway's drain window, so the process was killed before it could
+                # hand its rows back.
+                if not await self._acquire_or_stop(slots):
+                    break
                 try:
                     async with self.sessions() as s:
                         c = await queue.claim(s, self.id)
@@ -86,6 +91,19 @@ class Worker:
             for t in background:
                 t.cancel()
             await self._drain()
+
+    async def _acquire_or_stop(self, slots: asyncio.Semaphore) -> bool:
+        acquire = asyncio.ensure_future(slots.acquire())
+        stop = asyncio.ensure_future(self._stopping.wait())
+        await asyncio.wait({acquire, stop}, return_when=asyncio.FIRST_COMPLETED)
+        stop.cancel()
+        if self._stopping.is_set():
+            if acquire.done() and not acquire.cancelled():
+                slots.release()
+            else:
+                acquire.cancel()
+            return False
+        return True
 
     async def _drain(self) -> None:
         """Give in-flight domains back to the queue instead of waiting minutes for them."""
@@ -210,19 +228,25 @@ class Worker:
         if job is None or not job.webhook_url:
             return
         rows = await queue.row_indexes(s, c.job_id, c.domain)
+        counts = None
+        if job_done:
+            from app.jobs import job_counts
+
+            counts = await job_counts(s, c.job_id)
+        # Give the connection back before submit(), which waits when the delivery queue
+        # is full: holding it there let one slow receiver pin the whole pool, stall
+        # heartbeats and get live rows reaped and processed twice.
+        await s.commit()
+        await s.close()
         await self.webhooks.submit(job.webhook_url, {
             "event": "domain.done",
             "job_id": str(c.job_id),
             "row_indexes": rows,
             "result": result.model_dump(mode="json"),
         })
-        if job_done:
-            from app.jobs import job_counts
-
+        if counts is not None:
             await self.webhooks.submit(job.webhook_url, {
-                "event": "job.done",
-                "job_id": str(c.job_id),
-                "counts": await job_counts(s, c.job_id),
+                "event": "job.done", "job_id": str(c.job_id), "counts": counts,
             })
 
 

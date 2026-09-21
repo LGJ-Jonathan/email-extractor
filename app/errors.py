@@ -50,6 +50,10 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "invalid_file": (422, "the file could not be read"),
     "rate_limited": (429, "too many requests for this user; see retry_after"),
     "job_limit_reached": (429, "too many unfinished jobs for this user"),
+    "invalid_request": (400, "the request could not be read"),
+    "forbidden": (403, "the key may not do this"),
+    "acting_user_revoked": (403, "the person named in X-Acting-User was removed"),
+    "conflict": (409, "the request conflicts with the current state"),
     "internal_error": (500, "a bug; quote the request_id"),
     "provider_quota_exhausted": (503, "the fetch provider account is out of credit or "
                                       "rejecting the key; jobs are paused, not failed"),
@@ -124,6 +128,40 @@ class RequestId:
         await self.app(scope, receive, send_with_id)
 
 
+def _is_outage(exc: BaseException) -> bool:
+    """A dependency being down, as opposed to a bug. Bare OSError is deliberately not
+    here: FileNotFoundError or a stray TimeoutError is a bug, and calling it an outage
+    made the portal retry it."""
+    from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    import socket
+
+    # socket.gaierror: the database or Redis host does not resolve (asyncpg raises it
+    # unwrapped). Unlike the rest of OSError it can only mean a dependency is missing.
+    if isinstance(exc, (OperationalError, InterfaceError, PoolTimeout, ConnectionError,
+                        socket.gaierror)):
+        return True
+    try:
+        import asyncpg
+
+        if isinstance(exc, (asyncpg.exceptions.CannotConnectNowError,
+                            asyncpg.exceptions.TooManyConnectionsError,
+                            asyncpg.exceptions.ConnectionDoesNotExistError,
+                            asyncpg.exceptions.InterfaceError)):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    if isinstance(exc, DBAPIError) and exc.connection_invalidated:
+        return True
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeout
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, (RedisConnectionError, RedisTimeout))
+
+
 def install(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
@@ -156,12 +194,8 @@ def install(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception):
-        from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
-
         rid = _rid(request)
-        if isinstance(exc, (OperationalError, InterfaceError, ConnectionError, OSError)) or (
-            isinstance(exc, DBAPIError) and exc.connection_invalidated
-        ):
+        if _is_outage(exc):
             log.error("service_unavailable", extra={"request_id": rid,
                                                     "err": type(exc).__name__})
             return _response(request, 503, error_body(

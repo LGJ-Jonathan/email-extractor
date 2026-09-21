@@ -217,3 +217,54 @@ async def test_redis_bucket_uses_socket_timeouts():
     b._redis()
     kw = b._client.connection_pool.connection_kwargs
     assert kw["socket_timeout"] == 1.0 and kw["socket_connect_timeout"] == 1.0
+
+
+# --- second review pass ----------------------------------------------------
+
+
+def test_chunked_oversized_upload_is_413_not_400(api_key, monkeypatch):
+    """No Content-Length: the limit trips inside FastAPI's form parser."""
+    import app.main as main_mod
+
+    small_app_limit = 2000
+    for m in main_mod.app.user_middleware:
+        if m.cls is main_mod.BodySizeLimit:
+            monkeypatch.setitem(m.kwargs, "limit", small_app_limit)
+    main_mod.app.middleware_stack = None                 # rebuild with the new limit
+    try:
+        def gen():
+            yield b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.csv\"\r\n\r\n"
+            for _ in range(50):
+                yield b"website\nacme.com\n" * 10
+            yield b"\r\n--b--\r\n"
+
+        r = client.post("/jobs/preview", content=gen(), headers={
+            "X-API-Key": api_key, "content-type": "multipart/form-data; boundary=b"})
+        assert r.status_code == 413, r.text
+        assert r.json()["error"]["code"] == "file_too_large"
+    finally:
+        main_mod.app.middleware_stack = None
+
+
+def test_outages_are_503_and_bugs_are_500(api_key):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    for exc, status in ((PoolTimeout("pool full"), 503), (FileNotFoundError("x"), 500),
+                        (TimeoutError("stray"), 500)):
+        async def boom(*a, _e=exc, **k):
+            raise _e
+
+        with patch("app.main.process_input", boom):
+            r = client.post("/extract", json={"url": "acme.com"}, headers={"X-API-Key": api_key})
+        assert r.status_code == status, (exc, r.status_code)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("postgresql://u:p@h/d?sslmode=require", "postgresql+asyncpg://u:p@h/d?ssl=require"),
+    ("postgres://u:p@h/d?sslmode=disable", "postgresql+asyncpg://u:p@h/d"),
+    ("postgresql://u:p@h/d", "postgresql+asyncpg://u:p@h/d"),
+])
+def test_database_url_sslmode_becomes_asyncpg_ssl(url, expected):
+    from app.settings import Settings
+
+    assert Settings(database_url=url).database_url == expected

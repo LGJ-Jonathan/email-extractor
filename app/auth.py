@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 
 from fastapi import Header, Request
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.errors import ApiError
 from app.settings import settings
@@ -113,19 +113,26 @@ async def _acting_principal(session, service_name: str, email: str | None,
     email = email.strip().lower()
     if not _EMAIL.match(email):
         raise ApiError("invalid_acting_user", "X-Acting-User must be an email address")
-    # Keyless row: the hash is of a random secret nobody holds, so it can never log in.
-    await session.execute(
-        text("""
-            INSERT INTO users (id, name, key_hash, is_admin, is_service)
-            VALUES (:id, :name, :h, false, false)
-            ON CONFLICT (name) DO NOTHING
-        """),
-        {"id": uuid.uuid4(), "name": email, "h": hash_key("acting:" + secrets.token_hex(32))},
-    )
-    await session.commit()
-    person = await session.scalar(select(User).where(User.name == email))
+    # Read first: this runs on every request, polls included, and a write per poll
+    # was pure overhead. Matched case-insensitively, so a person added by hand as
+    # "Bob@X.com" is the same person the portal names as bob@x.com.
+    person = await session.scalar(select(User).where(func.lower(User.name) == email))
+    if person is None:
+        # Keyless row: the hash is of a random secret nobody holds, so it can never log in.
+        await session.execute(
+            text("""
+                INSERT INTO users (id, name, key_hash, is_admin, is_service)
+                VALUES (:id, :name, :h, false, false)
+                ON CONFLICT (name) DO NOTHING
+            """),
+            {"id": uuid.uuid4(), "name": email,
+             "h": hash_key("acting:" + secrets.token_hex(32))},
+        )
+        await session.commit()
+        person = await session.scalar(select(User).where(func.lower(User.name) == email))
     if person.revoked_at is not None:
-        raise ApiError("invalid_api_key", f"{email} has been removed from the extractor")
+        # 403, not 401: the portal's own key is fine; this person was removed.
+        raise ApiError("acting_user_revoked", f"{email} has been removed from the extractor")
     return Principal(user_id=person.id, name=email, is_admin=(role or "").lower() == "admin",
                      via=service_name)
 

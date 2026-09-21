@@ -194,6 +194,7 @@ async def create_job(
     webhook_url: str | None = None,
     fresh: bool = False,
     owner_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> tuple[Job, list[str], list[str]]:
     """Persist the job, its rows and its queue entries.
 
@@ -211,6 +212,7 @@ async def create_job(
         website_column=website_column,
         fresh=fresh,
         owner_id=owner_id,
+        idempotency_key=idempotency_key,
     )
     session.add(job)
     await session.flush()
@@ -283,13 +285,11 @@ SELECT
     coalesce(sum(jd.jina_tokens), 0) AS jina_tokens,
     count(*) FILTER (WHERE jd.state = 'done' AND NOT jd.from_cache
                      AND jd.jina_tokens > 0) AS fetched,
-    count(*) FILTER (WHERE (jd.result->>'needs_review')::boolean) AS needs_review,
-    count(*) FILTER (WHERE NOT jd.from_cache
-                     AND (jd.result->>'typesafe_called')::boolean) AS typesafe_calls,
-    count(*) FILTER (WHERE jsonb_array_length(coalesce(jd.result->'phones', '[]'::jsonb)) > 0)
-        AS with_phone,
-    count(*) FILTER (WHERE jd.result->>'contact_form_url' IS NOT NULL) AS with_form,
-    count(*) FILTER (WHERE jd.result->'socials'->>'linkedin' IS NOT NULL) AS with_linkedin
+    count(*) FILTER (WHERE jd.needs_review) AS needs_review,
+    count(*) FILTER (WHERE jd.typesafe_called) AS typesafe_calls,
+    count(*) FILTER (WHERE jd.has_phone) AS with_phone,
+    count(*) FILTER (WHERE jd.has_form) AS with_form,
+    count(*) FILTER (WHERE jd.has_linkedin) AS with_linkedin
 FROM job_domains jd
 WHERE jd.job_id = :j
 """)

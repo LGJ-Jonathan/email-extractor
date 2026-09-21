@@ -28,7 +28,19 @@ class Settings(BaseSettings):
         app needs the asyncpg driver named in the scheme."""
         for prefix in ("postgres://", "postgresql://"):
             if v.startswith(prefix):
-                return "postgresql+asyncpg://" + v[len(prefix):]
+                v = "postgresql+asyncpg://" + v[len(prefix):]
+                break
+        # asyncpg has no sslmode argument (SQLAlchemy passes query params straight to
+        # connect), so a pasted ?sslmode=require failed at connect. It takes ssl=.
+        if v.startswith("postgresql+asyncpg://") and "sslmode=" in v:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+            parts = urlsplit(v)
+            query = [(k, val) for k, val in parse_qsl(parts.query) if k != "sslmode"]
+            mode = dict(parse_qsl(parts.query)).get("sslmode", "")
+            if mode and mode not in ("disable", "allow", "prefer"):
+                query.append(("ssl", mode))
+            v = urlunsplit(parts._replace(query=urlencode(query)))
         return v
 
     # Fetching

@@ -96,7 +96,13 @@ async def claim(session: AsyncSession, worker: str) -> Claim | None:
         if row is None:
             continue                      # another worker took the last one
         await session.execute(
-            text("UPDATE jobs SET status = 'running' WHERE id = :j AND status = 'queued'"),
+            text("""
+                UPDATE jobs
+                SET status = CASE WHEN status = 'queued' THEN 'running'::job_status
+                                  ELSE status END,
+                    started_at = coalesce(started_at, now())
+                WHERE id = :j AND (status = 'queued' OR started_at IS NULL)
+            """),
             {"j": job_id},
         )
         await session.commit()
@@ -200,13 +206,19 @@ async def finish(session: AsyncSession, c: Claim, result: DomainResult,
             UPDATE job_domains
             SET state = 'done', finished_at = now(), claimed_by = NULL,
                 from_cache = :fc, jina_tokens = :tokens,
-                status = :status, result = CAST(:result AS jsonb)
+                status = :status, result = CAST(:result AS jsonb),
+                needs_review = :needs_review, typesafe_called = :typesafe_called,
+                has_phone = :has_phone, has_form = :has_form, has_linkedin = :has_linkedin
             WHERE job_id = :j AND domain = :d AND state = 'running' AND claimed_by = :tok
             RETURNING domain
         """),
         {"j": c.job_id, "d": c.domain, "tok": c.token, "fc": from_cache,
          "tokens": 0 if from_cache else result.jina_tokens,
-         "status": result.status, "result": payload},
+         "status": result.status, "result": payload,
+         "needs_review": bool(result.needs_review),
+         "typesafe_called": bool(result.typesafe_called) and not from_cache,
+         "has_phone": bool(result.phones), "has_form": bool(result.contact_form_url),
+         "has_linkedin": bool(result.socials.get("linkedin"))},
     )).first()
     if owned is None:
         await session.rollback()
