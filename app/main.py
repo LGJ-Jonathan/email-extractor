@@ -1,5 +1,6 @@
 """FastAPI app (spec sections 5 and 14)."""
 
+import hashlib
 import json
 import logging
 import uuid
@@ -199,8 +200,18 @@ async def jobs_preview(
 IDEMPOTENCY_KEY_MAX = 200
 
 
-async def _replay(session: AsyncSession, who: Principal, key: str) -> dict | None:
-    """The response of the job this person already created with this key, if any."""
+def _fingerprint(content: bytes, column: str | None, fresh: bool, webhook_url: str | None) -> str:
+    h = hashlib.sha256(content)
+    h.update(json.dumps([column, bool(fresh), webhook_url]).encode())
+    return h.hexdigest()
+
+
+async def _replay(session: AsyncSession, who: Principal, key: str,
+                  fingerprint: str) -> dict | None:
+    """The response of the job this person already created with this key, if any.
+
+    The same key with a different request (another file, column or setting) is a
+    client bug; answering it with the old job would silently ignore the change."""
     job = await session.scalar(
         select(Job).where(
             Job.idempotency_key == key,
@@ -209,6 +220,10 @@ async def _replay(session: AsyncSession, who: Principal, key: str) -> dict | Non
     )
     if job is None:
         return None
+    if job.idempotency_fingerprint and job.idempotency_fingerprint != fingerprint:
+        raise ApiError("idempotency_conflict",
+                       "this Idempotency-Key was already used for a different request",
+                       details={"job_id": str(job.id)})
     counts = await jobs_svc.job_counts(session, job.id)
     return {"job_id": str(job.id), "total": counts["total"],
             "unique_domains": counts["unique_domains"], "cached": counts["cached"],
@@ -244,6 +259,7 @@ async def create_job(
                            details={"columns": parsed.headers})
         items = jobs_svc.prepare_items(parsed, guess, chosen)
         source_columns, source_name = parsed.headers, filename
+        content = raw
     else:
         # Both of these were bare 500s: malformed JSON, and {"items": "acme.com"}.
         try:
@@ -265,6 +281,8 @@ async def create_job(
         items = jobs_svc.prepare_plain(body.items)
         source_columns, source_name = ["website"], None
         webhook_url, fresh, chosen = body.webhook_url, body.fresh, "website"
+        content = json.dumps(body.items).encode()
+    fingerprint = _fingerprint(content, chosen, fresh, webhook_url)
 
     if len(items) > MAX_ITEMS_PER_JOB:
         raise ApiError("too_many_rows",
@@ -272,10 +290,6 @@ async def create_job(
                        details={"limit": MAX_ITEMS_PER_JOB})
     if not items:
         raise ApiError("no_rows", "there are no rows to process")
-    try:
-        await validate_webhook_url(webhook_url)
-    except WebhookRejected as e:
-        raise ApiError("invalid_webhook_url", str(e)) from e
     if idempotency_key is not None and not (0 < len(idempotency_key) <= IDEMPOTENCY_KEY_MAX):
         raise ApiError("validation_error", "Idempotency-Key must be 1-200 characters",
                        details=[{"field": "Idempotency-Key", "msg": "bad length"}])
@@ -286,10 +300,16 @@ async def create_job(
         text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"jobs:{who.user_id}"}
     )
     if idempotency_key:
-        replay = await _replay(session, who, idempotency_key)
+        replay = await _replay(session, who, idempotency_key, fingerprint)
         if replay is not None:
             await session.rollback()
             return replay
+    # After the replay check: a retry of a job that already exists must get that job
+    # back even if its webhook host has since stopped resolving.
+    try:
+        await validate_webhook_url(webhook_url)
+    except WebhookRejected as e:
+        raise ApiError("invalid_webhook_url", str(e)) from e
     if not who.is_admin:
         active = await session.scalar(
             select(func.count()).select_from(Job).where(
@@ -313,6 +333,7 @@ async def create_job(
         fresh=fresh,
         owner_id=who.user_id,
         idempotency_key=idempotency_key,
+        idempotency_fingerprint=fingerprint if idempotency_key else None,
     )
     return {
         "job_id": str(job.id),
@@ -366,7 +387,9 @@ async def _active_seconds(session: AsyncSession, job_id) -> float | None:
         text("""
             SELECT extract(epoch FROM coalesce(finished_at, now()) - started_at)
                    - paused_seconds
-                   - coalesce(extract(epoch FROM now() - paused_at), 0)
+                   - CASE WHEN paused_at IS NOT NULL AND finished_at IS NULL
+                          THEN extract(epoch FROM now() - greatest(paused_at, started_at))
+                          ELSE 0 END
             FROM jobs WHERE id = :j AND started_at IS NOT NULL
         """),
         {"j": job_id},
@@ -464,9 +487,16 @@ async def _transition(session: AsyncSession, job: Job, allowed: tuple[str, ...],
     row = (await session.execute(
         text("""
             UPDATE jobs SET status = CAST(:new AS job_status), pause_reason = :reason,
-                paused_seconds = paused_seconds + coalesce(
-                    extract(epoch FROM now() - paused_at), 0),
-                paused_at = NULL
+                -- Only pauses after work began count: a queued job paused before its
+                -- first claim has no active time to subtract them from.
+                paused_seconds = paused_seconds + CASE
+                    WHEN started_at IS NOT NULL AND paused_at IS NOT NULL
+                    THEN extract(epoch FROM now() - greatest(paused_at, started_at))
+                    ELSE 0 END,
+                paused_at = NULL,
+                -- A cancelled job is over; without this its active time grew forever.
+                finished_at = CASE WHEN CAST(:new AS text) = 'cancelled'
+                                   THEN coalesce(finished_at, now()) ELSE finished_at END
             WHERE id = :j AND status::text = ANY(:allowed)
             RETURNING status::text
         """),
@@ -511,6 +541,18 @@ async def cancel_job(
         raise ApiError("job_already_finished", f"the job is already {status}",
                        details={"status": status})
     return {"job_id": str(job.id), "status": "cancelled"}
+
+
+@app.get("/providers/status")
+async def providers_status(
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Jina credit, TypeSafe key status and this month's usage (the portal's strip).
+    Balances only; nothing else from the vendors' account records leaves the service."""
+    from app.providers import provider_status
+
+    return await provider_status(session)
 
 
 @app.get("/jobs")

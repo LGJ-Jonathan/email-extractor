@@ -54,6 +54,7 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "forbidden": (403, "the key may not do this"),
     "acting_user_revoked": (403, "the person named in X-Acting-User was removed"),
     "conflict": (409, "the request conflicts with the current state"),
+    "idempotency_conflict": (409, "the Idempotency-Key was already used for a different request"),
     "internal_error": (500, "a bug; quote the request_id"),
     "provider_quota_exhausted": (503, "the fetch provider account is out of credit or "
                                       "rejecting the key; jobs are paused, not failed"),

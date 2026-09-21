@@ -1,6 +1,7 @@
 """Fixes from the 71ee797 review that need no database."""
 
 import asyncio
+import json
 import hashlib
 import hmac
 import time
@@ -261,10 +262,77 @@ def test_outages_are_503_and_bugs_are_500(api_key):
 
 @pytest.mark.parametrize("url,expected", [
     ("postgresql://u:p@h/d?sslmode=require", "postgresql+asyncpg://u:p@h/d?ssl=require"),
-    ("postgres://u:p@h/d?sslmode=disable", "postgresql+asyncpg://u:p@h/d"),
+    ("postgres://u:p@h/d?sslmode=disable", "postgresql+asyncpg://u:p@h/d?ssl=disable"),
     ("postgresql://u:p@h/d", "postgresql+asyncpg://u:p@h/d"),
 ])
 def test_database_url_sslmode_becomes_asyncpg_ssl(url, expected):
     from app.settings import Settings
 
     assert Settings(database_url=url).database_url == expected
+
+
+# --- third review pass: provider status -------------------------------------
+
+
+@respx.mock
+async def test_provider_status_returns_only_balances(monkeypatch):
+    from app import providers
+
+    monkeypatch.setattr(settings, "jina_api_key", "jina_test")
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts_test")
+    providers.reset_cache()
+    jina_route = respx.get(providers.JINA_WALLET_URL).mock(return_value=httpx.Response(200, json={
+        "email": "owner@example.com", "billing_address": {"line1": "1 Main St"},
+        "payment_method": {"last4": "4242"},
+        "wallet": {"total_balance": -3322350, "regular_balance": -3322350},
+    }))
+    ts_route = respx.get(providers.TYPESAFE_MODELS_URL).mock(return_value=httpx.Response(200, json={}))
+
+    class FakeSession:
+        async def execute(self, _):
+            class R:
+                def mappings(self):
+                    class M:
+                        def one(self):
+                            return {"jina_tokens": 5, "typesafe_calls": 2, "domains_fetched": 3}
+                    return M()
+            return R()
+
+    out = await providers.provider_status(FakeSession())
+    assert out["jina"] == {"status": "empty", "balance_tokens": -3322350}
+    assert out["typesafe"] == {"status": "ok"}
+    assert out["usage_this_month"] == {"jina_tokens": 5, "typesafe_calls": 2, "domains_fetched": 3}
+    flat = json.dumps(out)
+    assert "owner@example.com" not in flat and "4242" not in flat and "Main St" not in flat
+    # cached: a second call does not hit the vendors again
+    await providers.provider_status(FakeSession())
+    assert jina_route.call_count == 1 and ts_route.call_count == 1
+    providers.reset_cache()
+
+
+@pytest.mark.parametrize("balance,state", [(None, "unknown"), (-5, "empty"), (0, "empty"),
+                                           (10, "low"), (10**10, "ok")])
+def test_jina_balance_states(balance, state):
+    from app.providers import jina_state
+
+    assert jina_state(balance) == state
+
+
+@respx.mock
+async def test_provider_failures_read_as_unknown_or_rejected(monkeypatch):
+    from app import providers
+
+    monkeypatch.setattr(settings, "jina_api_key", "jina_test")
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts_test")
+    respx.get(providers.JINA_WALLET_URL).mock(side_effect=httpx.ConnectError("down"))
+    respx.get(providers.TYPESAFE_MODELS_URL).mock(return_value=httpx.Response(401))
+    async with httpx.AsyncClient() as c:
+        assert (await providers._jina(c))["status"] == "unknown"
+        assert (await providers._typesafe(c))["status"] == "rejected"
+
+
+def test_sslmode_disable_is_kept_explicit():
+    from app.settings import Settings
+
+    assert Settings(database_url="postgresql://u@h/d?sslmode=disable&application_name=").database_url \
+        == "postgresql+asyncpg://u@h/d?application_name=&ssl=disable"

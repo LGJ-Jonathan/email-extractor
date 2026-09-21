@@ -59,6 +59,8 @@ class User(Base):
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    __table_args__ = (Index("ux_users_lower_name", text("lower(name)"), unique=True),)
+
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -90,6 +92,7 @@ class Job(Base):
     paused_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0,
                                                   server_default="0")
     idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Null for jobs created with the bootstrap API_KEY.
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

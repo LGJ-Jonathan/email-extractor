@@ -195,6 +195,7 @@ async def create_job(
     fresh: bool = False,
     owner_id: uuid.UUID | None = None,
     idempotency_key: str | None = None,
+    idempotency_fingerprint: str | None = None,
 ) -> tuple[Job, list[str], list[str]]:
     """Persist the job, its rows and its queue entries.
 
@@ -213,6 +214,7 @@ async def create_job(
         fresh=fresh,
         owner_id=owner_id,
         idempotency_key=idempotency_key,
+        idempotency_fingerprint=idempotency_fingerprint,
     )
     session.add(job)
     await session.flush()

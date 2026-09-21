@@ -36,9 +36,12 @@ class Settings(BaseSettings):
             from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
             parts = urlsplit(v)
-            query = [(k, val) for k, val in parse_qsl(parts.query) if k != "sslmode"]
-            mode = dict(parse_qsl(parts.query)).get("sslmode", "")
-            if mode and mode not in ("disable", "allow", "prefer"):
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+            query = [(k, val) for k, val in pairs if k != "sslmode"]
+            mode = dict(pairs).get("sslmode", "")
+            # disable must be said explicitly: dropping it leaves asyncpg on its own
+            # default, which still tries SSL first.
+            if mode in ("disable", "require", "verify-ca", "verify-full"):
                 query.append(("ssl", mode))
             v = urlunsplit(parts._replace(query=urlencode(query)))
         return v
@@ -48,6 +51,8 @@ class Settings(BaseSettings):
     jina_api_key: str = ""
     jina_rpm: int = 500
     jina_timeout_s: int = 10
+    # Below this the portal shows Jina credit as "low". A 50k-row job spends ~1.3B.
+    jina_low_balance_tokens: int = 100_000_000
     # "redis" shares one Jina budget across the API and every worker process. "local"
     # keeps it in-process, which is right for scripts/eval.py and the tests.
     rate_limit_backend: Literal["local", "redis"] = "local"

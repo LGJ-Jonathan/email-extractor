@@ -868,3 +868,101 @@ async def test_worker_stops_promptly_when_every_slot_is_busy(db, monkeypatch):
     async with db() as s:
         running = await s.scalar(text("SELECT count(*) FROM job_domains WHERE state='running'"))
     assert running == 0 and len(calls) == 2              # nothing new claimed after stop
+
+
+# --- third review pass ----------------------------------------------------
+
+
+async def test_reusing_a_key_for_a_different_request_is_409(db):
+    import httpx
+
+    from app.main import app
+
+    svc = await make_service(db)
+    h = {"X-API-Key": svc, "X-Acting-User": "k@x.com", "Idempotency-Key": "same-key-1"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.post("/jobs", json={"items": ["a.com"]}, headers=h)).status_code == 200
+        r = await c.post("/jobs", json={"items": ["a.com"], "fresh": True}, headers=h)
+        assert r.status_code == 409 and r.json()["error"]["code"] == "idempotency_conflict"
+        r = await c.post("/jobs", json={"items": ["a.com"]}, headers=h)
+        assert r.status_code == 200 and r.json()["replayed"] is True
+
+
+async def test_cancelled_jobs_stop_accruing_active_time(db, api_key):
+    import httpx
+
+    from app import queue
+    from app.main import app
+
+    job = await make_job(db, ["c1.com", "c2.com"])
+    async with db() as s:
+        await queue.claim(s, "w")
+        await s.execute(text("UPDATE jobs SET started_at = now() - interval '1 hour'"))
+        await s.commit()
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        await c.post(f"/jobs/{job.id}/cancel", headers=h)
+        first = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+        await asyncio.sleep(1.1)
+        second = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+    assert first["finished_at"] and abs(second["active_seconds"] - first["active_seconds"]) < 0.5
+
+
+async def test_a_pause_before_the_first_claim_is_not_subtracted(db, api_key):
+    import httpx
+
+    from app import queue
+    from app.main import app
+
+    job = await make_job(db, ["q1.com"])
+    async with db() as s:
+        await queue.pause_active_jobs(s, "jina_account")
+        await s.execute(text("UPDATE jobs SET paused_at = now() - interval '8 hours'"))
+        await s.commit()
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        await c.post(f"/jobs/{job.id}/resume", headers=h)
+    async with db() as s:
+        assert await s.scalar(text("SELECT paused_seconds FROM jobs")) == 0
+        await queue.claim(s, "w")
+        await s.execute(text("UPDATE jobs SET started_at = now() - interval '10 minutes'"))
+        await s.commit()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        d = (await c.get(f"/jobs/{job.id}", headers=h)).json()
+    assert 590 < d["active_seconds"] < 700
+
+
+async def test_one_person_one_row_whatever_the_case(db):
+    import httpx
+
+    from app.main import app
+
+    svc = await make_service(db)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for who in ("Mixed@Case.com", "mixed@case.com", "MIXED@CASE.COM"):
+            await c.get("/jobs", headers={"X-API-Key": svc, "X-Acting-User": who})
+    async with db() as s:
+        n = await s.scalar(text("SELECT count(*) FROM users WHERE lower(name) = 'mixed@case.com'"))
+    assert n == 1
+
+
+async def test_providers_status_endpoint_shape(db, api_key, monkeypatch):
+    import httpx
+
+    from app import providers
+    from app.main import app
+
+    async def fake_jina(client):
+        return {"status": "low", "balance_tokens": 42}
+
+    async def fake_ts(client):
+        return {"status": "ok"}
+
+    monkeypatch.setattr(providers, "_jina", fake_jina)
+    monkeypatch.setattr(providers, "_typesafe", fake_ts)
+    providers.reset_cache()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/providers/status", headers={"X-API-Key": api_key})).json()
+    providers.reset_cache()
+    assert body["jina"] == {"status": "low", "balance_tokens": 42}
+    assert set(body["usage_this_month"]) == {"jina_tokens", "typesafe_calls", "domains_fetched"}

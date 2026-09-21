@@ -29,7 +29,7 @@ _EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,189}\.[A-Za-z]{2,24}$")
 
 # Status polling is exempt from the rate limit: the portal polls every few seconds per
 # open job, and counting that would lock people out for watching their own progress.
-_UNLIMITED = re.compile(r"^/jobs(/[^/]+(/recent)?)?$")
+_UNLIMITED = re.compile(r"^(/jobs(/[^/]+(/recent)?)?|/providers/status)$")
 
 
 @dataclass(frozen=True)
@@ -116,25 +116,38 @@ async def _acting_principal(session, service_name: str, email: str | None,
     # Read first: this runs on every request, polls included, and a write per poll
     # was pure overhead. Matched case-insensitively, so a person added by hand as
     # "Bob@X.com" is the same person the portal names as bob@x.com.
-    person = await session.scalar(select(User).where(func.lower(User.name) == email))
+    person = await _person(session, email)
     if person is None:
         # Keyless row: the hash is of a random secret nobody holds, so it can never log in.
         await session.execute(
             text("""
                 INSERT INTO users (id, name, key_hash, is_admin, is_service)
                 VALUES (:id, :name, :h, false, false)
-                ON CONFLICT (name) DO NOTHING
+                ON CONFLICT DO NOTHING
             """),
             {"id": uuid.uuid4(), "name": email,
              "h": hash_key("acting:" + secrets.token_hex(32))},
         )
         await session.commit()
-        person = await session.scalar(select(User).where(func.lower(User.name) == email))
+        person = await _person(session, email)
     if person.revoked_at is not None:
         # 403, not 401: the portal's own key is fine; this person was removed.
         raise ApiError("acting_user_revoked", f"{email} has been removed from the extractor")
     return Principal(user_id=person.id, name=email, is_admin=(role or "").lower() == "admin",
                      via=service_name)
+
+
+async def _person(session, email: str):
+    """The user row for this email. lower(name) is unique since migration 0007; the
+    ordering only matters for rows made before it (exact spelling, then active)."""
+    from app.models import User
+
+    return await session.scalar(
+        select(User)
+        .where(func.lower(User.name) == email)
+        .order_by((User.name == email).desc(), User.revoked_at.is_(None).desc(), User.created_at)
+        .limit(1)
+    )
 
 
 # --- per-person request rate limit -------------------------------------------
