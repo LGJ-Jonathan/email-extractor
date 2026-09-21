@@ -401,3 +401,27 @@ async def test_a_domains_own_failure_is_not_retried(fake_dns, _instant_retries):
     r = await process_domain("acme.com", f)
     assert (r.status, r.error_reason) == ("fetch_failed", "dns")
     assert f.calls == []
+
+
+async def test_provider_account_error_stops_the_run_rather_than_faking_a_result(fake_dns):
+    """_process raises it "to the worker", but the Bug handler caught it first -- so an
+    exhausted Jina balance turned every remaining domain into an internal_error row."""
+    fake_dns()
+    f = FakeFetcher(
+        {"https://acme.com/": FetchError(ErrorClass.PROVIDER_ACCOUNT, "jina_account")}
+    )
+    with pytest.raises(FetchError) as exc:
+        await process_domain("acme.com", f)
+    assert exc.value.error_class is ErrorClass.PROVIDER_ACCOUNT
+
+
+async def test_any_other_fetch_error_is_still_swallowed(fake_dns, monkeypatch):
+    """Widening the handler must not let other FetchErrors escape and fail a whole job."""
+    fake_dns()
+
+    async def escaped(*a, **kw):
+        raise FetchError(ErrorClass.TRANSIENT, "homepage", "escaped the stage handlers")
+
+    monkeypatch.setattr(run_mod, "_process", escaped)
+    r = await process_domain("acme.com", FakeFetcher({}))
+    assert (r.status, r.error_reason) == ("fetch_failed", "internal_error")

@@ -20,7 +20,13 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from app.pipeline.fetch import build_fetcher, build_gate, close_client  # noqa: E402
+from app.pipeline.fetch import (  # noqa: E402
+    ErrorClass,
+    FetchError,
+    build_fetcher,
+    build_gate,
+    close_client,
+)
 from app.pipeline.normalize import normalize_input  # noqa: E402
 from app.pipeline.run import process_domain  # noqa: E402
 from app.schemas import DomainResult  # noqa: E402
@@ -143,8 +149,25 @@ async def run(rows, concurrency: int, out: pathlib.Path, every: int = 100):
         async with sem:
             await record(raw, label, await process_domain(norm.domain, fetcher))
 
+    # Tasks rather than bare coroutines, so an aborted run can cancel the rest instead
+    # of leaving them writing into a closed file.
+    tasks = [asyncio.create_task(one(w, e)) for w, e in rows]
     try:
-        await asyncio.gather(*(one(w, e) for w, e in rows))
+        await asyncio.gather(*tasks)
+    except FetchError as exc:
+        # A dead key or an exhausted balance answers the same way for every remaining
+        # domain. Finishing the run would just convert the rest of the list into
+        # failure rows that look like ours rather than the provider's.
+        if exc.error_class is not ErrorClass.PROVIDER_ACCOUNT:
+            raise
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"\n!! ABORTED on a provider account error: {exc}", flush=True)
+        print(f"   {state['done']:,} of {len(rows):,} domains completed and written.",
+              flush=True)
+        print(f"   {state['tokens']:,} tokens spent. Top up, then re-run from row "
+              f"{state['done']:,}.", flush=True)
     finally:
         fh.flush(); fh.close()
         await close_client()

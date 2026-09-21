@@ -15,7 +15,13 @@ from app.pipeline import parked as parked_mod
 from app.pipeline.parked import visible_text
 from app.pipeline.discovery import discover_pages, fetch_text_or_blank
 from app.pipeline.dns_check import DnsResult, check_domain
-from app.pipeline.fetch import Fetcher, FetchError, FetchResult, build_fetcher
+from app.pipeline.fetch import (
+    ErrorClass,
+    Fetcher,
+    FetchError,
+    FetchResult,
+    build_fetcher,
+)
 from app.ratelimit import CircuitOpen
 from app.pipeline.normalize import crawl_url, host_of_key, normalize_input, registrable
 from app.pipeline.extract.emails import EmailCandidate, extract_page, merge_pages
@@ -161,6 +167,22 @@ async def _attempt_domain(domain: str, fetcher: Fetcher) -> DomainResult:
         return _result(
             domain, status="fetch_failed", error_reason="domain_timeout",
             mx_provider=scratch.dns.mx_provider if scratch.dns else None,
+        )
+    except FetchError as e:
+        # A dead key or an empty quota is not this domain's problem and not a Bug: it
+        # is the same answer for every remaining domain. The `raise err` in _process
+        # says it "bubbles to the worker", but the Bug handler below was catching it
+        # first, so the documented pause never happened -- an exhausted Jina balance
+        # would quietly turn the rest of a 16k run into internal_error rows.
+        if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
+            log.error("provider_account", extra={"domain": domain, "detail": str(e)})
+            raise
+        log.exception("internal_error", extra={"domain": domain})
+        return _result(
+            domain,
+            status="fetch_failed",
+            error_reason="internal_error",
+            site_status=f"{type(e).__name__}",
         )
     except Exception as e:  # noqa: BLE001 - spec 17 Bug class: never fail the job
         log.exception("internal_error", extra={"domain": domain})
