@@ -10,3 +10,5 @@ __pycache__/
 data/
 uv.lock
 SPEC.v1.md
+scripts/eval_out/
+tests/

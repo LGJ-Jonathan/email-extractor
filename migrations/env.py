@@ -30,7 +30,13 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+# Any fixed number; shared by every process that migrates this database.
+MIGRATION_LOCK_ID = 7340_2601
+
+
 def do_run_migrations(connection) -> None:
+    from sqlalchemy import text
+
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -38,6 +44,10 @@ def do_run_migrations(connection) -> None:
         compare_server_default=True,
     )
     with context.begin_transaction():
+        # Railway runs the pre-deploy migration for the API and the worker at the same
+        # time. The second waits here, then finds nothing left to do. Transaction-scoped,
+        # so it is released by the migration's own commit or rollback.
+        connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": MIGRATION_LOCK_ID})
         context.run_migrations()
 
 
