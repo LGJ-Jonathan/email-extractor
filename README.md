@@ -6,83 +6,136 @@ ranked, with one status per domain. Full contract: [SPEC.md](SPEC.md).
 Code finds every email; the model only *chooses* among emails found verbatim on a fetched
 page. No email is ever emitted that did not appear in fetched HTML.
 
-## Run
+The team uses it through the **Email Extractor** page of the HTM portal
+(clients.leadgenjay.com/email-extractor): upload a CSV/XLSX or paste domains, confirm the
+website column, watch progress, download results. The portal talks to this service
+server-side; nobody needs a key of their own.
 
-```bash
-cp .env.example .env      # then fill JINA_API_KEY, TYPESAFE_API_KEY, API_KEY
-docker compose up --build -d
-docker compose exec api python -m app.users add "Sam"     # prints Sam's key once
-```
+## Where it runs
 
-`migrate` runs `alembic upgrade head` first; `api` then serves on :8000 and `worker`
-(`python -m app.worker`) processes jobs. The port binds to `127.0.0.1` unless
-`BIND_ADDR` is set in `.env` -- set it to the machine's Tailscale IP to share it with
-the team over the tailnet.
+Production is the Railway project **high-ticket-portal**, next to the portal, in the
+same region:
 
-## Users
+| Service | What | Notes |
+| --- | --- | --- |
+| `email-extractor` | API (`ROLE=api`, `python -m app.serve`, port 8080) | No public domain. The portal reaches it at `http://email-extractor.railway.internal:8080` over Railway's private network. 2 GB. |
+| `email-extractor-worker` | Worker (`ROLE=worker`, `python -m app.worker`) | One process, 50 domains at a time. 2 GB, 30 s drain on redeploy. |
+| `Postgres` | Jobs, queue, results cache, users, keys | Private only. |
+| `Redis` | Shared Jina rate limit, per-person request limit | Private only; losing it is harmless. |
 
-Each person gets their own key: `python -m app.users add NAME [--admin]`, `list`,
-`revoke NAME`. Only a sha256 of the key is stored. A person sees only their own jobs
-(someone else's job is a 404) and may have `MAX_ACTIVE_JOBS_PER_USER` unfinished jobs
-at once. `API_KEY` from `.env` is the bootstrap admin key and sees every job.
+Both extractor services build this repo's **`master`** branch from the `Dockerfile`;
+`scripts/start.sh` picks the process from `ROLE`. `alembic upgrade head` runs as the
+pre-deploy command on both (an advisory lock makes the concurrent runs safe).
+A push to `master` redeploys both.
+
+Variables (set per service in Railway; values never in git):
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL`, `REDIS_URL` | both | references to `${{Postgres.DATABASE_URL}}` / `${{Redis.REDIS_URL}}` |
+| `JINA_API_KEY`, `TYPESAFE_API_KEY` | both | fallback keys; a key saved from the portal overrides them |
+| `PROVIDER_KEY_ENCRYPTION_KEY` | both, **identical** | encrypts keys saved from the portal (base64 of 32 bytes) |
+| `API_KEY` | api | bootstrap admin key, ≥ 32 characters |
+| `ROLE`, `PORT` | per service | `api` + `8080` / `worker` |
+| `RATE_LIMIT_BACKEND=redis`, `JINA_RPM`, `GLOBAL_FETCH_CONCURRENCY`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW` | both | throughput and connections (API 10+10, worker 20+20, under Postgres's 100) |
+
+The portal needs `EMAIL_EXTRACTOR_BASE_URL` and `EMAIL_EXTRACTOR_API_KEY` (a service key,
+below) on its `high-ticket-portal` service.
+
+## Who can do what
+
+- **Service key (the portal).** `python -m app.users add portal --service`. It must name
+  the signed-in person in `X-Acting-User` (their verified email); everything --
+  ownership, fair sharing, limits, visibility -- then applies to that person.
+  `X-Acting-Role: admin` (portal admins) sees everyone's jobs. Both headers are refused
+  from any other key.
+- **Personal keys.** `python -m app.users add NAME [--admin]`, `list`, `revoke NAME`.
+  Only a sha256 is stored; the key is shown once.
+- **Bootstrap admin.** `API_KEY`; refused if it is a placeholder or shorter than 32.
+
+Run these inside the API service: `railway ssh --service email-extractor -- python -m app.users list`.
+
+Limits per person: 3 unfinished jobs, 50,000 rows / 50 MB per job, 120 requests a
+minute (status polling exempt). Someone else's job is a 404.
+
+## Provider keys (Jina, TypeSafe)
+
+Admins set them in the portal (Email Extractor → Provider keys). Each key is checked
+with the provider first, stored AES-GCM encrypted under `PROVIDER_KEY_ENCRYPTION_KEY`,
+and never returned (last four only). The API and worker pick it up within ~30 s, no
+redeploy. Saving a Jina key with at least `JINA_RESUME_MIN_TOKENS` (10M) resumes the
+jobs paused for Jina credit.
+
+- A saved key a process cannot decrypt means **no key**, never the environment's, and
+  the portal shows it as unreadable (usually: `PROVIDER_KEY_ENCRYPTION_KEY` differs
+  between the two services).
+- Every save and removal is audited (`provider_key_audit`); changes are limited to 10 a
+  minute per caller, admins included.
+- Jina balance comes from its dashboard's wallet endpoint (not in Jina's public docs).
+  TypeSafe publishes no balance API, so only whether its key works is shown.
 
 ## API
 
-Every route except `/healthz` and `/` requires `X-API-Key` (401 otherwise).
+Every route except `/healthz` and `/` requires `X-API-Key`.
 
 | Route | What it does |
 | --- | --- |
-| `GET /` | upload page (spec §14) |
-| `POST /jobs` | JSON `{"items": [...]}` or a multipart file upload; queues the job |
-| `POST /jobs/preview` | detects the website column; creates nothing |
-| `GET /jobs` | the caller's 50 most recent jobs |
-| `GET /jobs/{id}` | progress: done, running, retrying, found, failed, cached, jina_tokens |
-| `GET /jobs/{id}/results.csv` / `.json` | the uploaded columns plus `ex_*` result columns, in row order; unfinished rows are `pending` |
-| `POST /jobs/{id}/resume` | resume a paused job (e.g. after topping up Jina) |
-| `POST /jobs/{id}/cancel` | stop claiming the job's domains |
+| `POST /jobs` | JSON `{"items": [...]}` or multipart file (+ `column`, `fresh`, `webhook_url`); optional `Idempotency-Key` |
+| `POST /jobs/preview` | detects the website column (or previews `column=`); creates nothing |
+| `GET /jobs` | the caller's 50 most recent jobs, with progress (admins: everyone's, with owner) |
+| `GET /jobs/{id}` | status, counts by outcome, needs review, captured, tokens, `active_seconds`, columns |
+| `GET /jobs/{id}/recent` | most recently finished domains |
+| `GET /jobs/{id}/results.csv` / `.json` | uploaded columns + `ex_*` result columns, row order; unfinished rows `pending` |
+| `POST /jobs/{id}/resume` / `cancel` | resume a paused job / stop one |
+| `GET /estimate?domains=N` | time range for N domains at this person's fair share of recent speed |
+| `GET /providers/status` | Jina balance, TypeSafe key status, this month's usage |
+| `GET` / `PUT` / `DELETE /providers/keys[/{jina\|typesafe}]` | admin: view / check-and-save / remove provider keys |
 | `POST /extract` | one domain, synchronously |
 
-```bash
-curl -s localhost:8000/jobs -H "X-API-Key: $KEY" -F file=@leads.csv
-```
+Every error is `{"error": {"code", "message", "retry_after", "details"}, "detail",
+"request_id"}` with `Retry-After` / `X-Request-ID` headers; the codes are listed in
+`app/errors.py` (`ERROR_CODES`). A site with no email is not an error: it is a 200
+result with `status` and `error_reason`.
 
 ## How jobs run
 
-The queue is Postgres (`app/queue.py`), not arq. arq is a single FIFO list: a 50k-row
-job queued first would hold every later job until it drained, and one arq job id per
-domain silently dropped the same domain from a second job.
+The queue is Postgres (`app/queue.py`), not arq: arq is one FIFO list, so a 50k-row job
+would hold every later job, and one arq job id per domain dropped a domain from a
+second job.
 
-- **Fair sharing.** Each claim goes to the user with the fewest domains in flight,
-  then that user's job with the fewest, then the oldest. Verified live: a 6-row job
-  submitted after a 39-row job took about half the slots and finished in 25s.
-- **Shared domains are fetched once.** A per-claim lock on `domains` makes a second job
-  wait for the first and then read its result; only the job that fetched pays tokens.
-- **Cache.** Results within `CACHE_DAYS` are reused unless the job has `fresh=true`;
-  `fetch_failed` results are never reused from the cache.
-- **Crash safety.** Workers heartbeat every 20s; rows silent for 90s are reaped back to
-  the queue. SIGTERM hands in-flight rows back without spending an attempt.
-- **Jina account errors** (402 etc.) pause every active job with
-  `pause_reason=jina_account` and mark no domain failed. Resume after topping up.
-- **Rate limit.** `RATE_LIMIT_BACKEND=redis` puts the token bucket in Redis, so the API
-  and every worker share one `JINA_RPM`. If Redis is down it falls back to in-process.
-- **Webhook.** Each finished domain is POSTed as `{job_id, row_indexes, result}`,
-  retried after 2s, 8s and 30s.
+- **Fair sharing.** Each free slot goes to the person with the fewest domains in flight,
+  then their least-served job, then the oldest. A 200-row upload starts at once beside
+  a 50k one. Total speed is shared: ~40-45 domains/min at `JINA_RPM=500`.
+- **Shared domains are fetched once**; a per-claim lock makes the second job read the
+  first one's result. Results within `CACHE_DAYS` (90) are reused unless `fresh=true`.
+- **Each job keeps what it received** (a snapshot in `job_domains`), so a finished job's
+  download never changes.
+- **Crash safety.** Heartbeats every 20 s, rows silent for 90 s are reaped; SIGTERM
+  hands in-flight rows back without spending an attempt.
+- **Jina out of credit** (402) pauses every active job and fails no domain.
+- **Uploads.** At most `MAX_CONCURRENT_UPLOADS` (2) files are parsed at once (a 50 MB
+  file peaks at ~400 MB); others wait up to 40 s, then get 503 `busy`.
+- **Webhook** (optional): each finished domain and a final `job.done`, HMAC-signed with
+  `WEBHOOK_SECRET`, to public https URLs only, through a bounded sender.
 
-## Local dev (no Docker)
+## Local dev
 
 ```bash
 uv venv --python 3.12 && uv pip install -r requirements-dev.txt
 uv run pytest
 ```
 
-Point `DATABASE_URL`/`REDIS_URL` at `localhost` instead of the compose hostnames.
 The queue tests need a Postgres they may wipe:
-`TEST_DATABASE_URL=postgresql+asyncpg://.../extractor_test uv run pytest tests/test_queue_pg.py`.
+`TEST_DATABASE_URL=postgresql+asyncpg://.../extractor_test uv run pytest`.
+`docker compose up --build` still runs the whole stack locally (the port binds to
+`127.0.0.1` unless `BIND_ADDR` is set).
 
 ## Secrets
 
-`.env` is gitignored and holds the real keys. `.env.example` holds placeholders only.
-Key values are never logged.
+`.env` is gitignored; `.env.example` holds placeholders only. Keys are never logged:
+httpx/httpcore are held at WARNING (httpx logs full request URLs, and Jina's wallet
+endpoint takes the key in the query string), and a filter masks anything key-like in
+every log line (`app/logsetup.py`).
 
 ## Verified deviations from SPEC.md
 
@@ -194,4 +247,5 @@ Section 15 edge cases are implemented inside the step that owns their stage.
 - [x] 6. Eval harness, rules-only baseline
 - [x] 7. Stage 7: TypeSafe
 - [x] 8. Jobs API, Postgres queue (replaces arq), per-user keys, cache, CSV/JSON, webhook, upload page (§14)
-- [ ] 9. 5k soak test through the running service, then 50k
+- [x] Portal integration: service key + acting user, error contract, estimates, provider keys; on Railway
+- [ ] 9. 5k soak test through the running service, then 50k (needs Jina credit)
