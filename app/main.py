@@ -1,9 +1,11 @@
 """FastAPI app (spec sections 5 and 14)."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -54,9 +56,14 @@ async def lifespan(app: FastAPI):
     if not admin_key_usable():
         log.error("API_KEY is a placeholder or shorter than 32 characters; the admin key "
                   "is disabled until it is replaced")
+    from app import provider_keys
+
+    provider_keys.set_process_name("api")
     refresher = asyncio.create_task(_refresh_provider_keys_forever())
     yield
     refresher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await refresher
     from app.pipeline.fetch import close_client
 
     await close_client()
@@ -433,17 +440,24 @@ async def get_job(
 
 
 _LIST_PROGRESS = text("""
+WITH counts AS (
+    SELECT job_id, count(*) AS unique_domains,
+           count(*) FILTER (WHERE state = 'done') AS done,
+           count(*) FILTER (WHERE state = 'done' AND status = 'found') AS found
+    FROM job_domains WHERE job_id = ANY(:ids)
+    GROUP BY job_id
+)
 SELECT j.id,
-       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id) AS unique_domains,
-       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id AND q.state = 'done') AS done,
-       (SELECT count(*) FROM job_domains q WHERE q.job_id = j.id AND q.state = 'done'
-                                              AND q.status = 'found') AS found,
+       coalesce(c.unique_domains, 0) AS unique_domains,
+       coalesce(c.done, 0) AS done,
+       coalesce(c.found, 0) AS found,
        CASE WHEN j.started_at IS NULL THEN NULL ELSE greatest(0,
            extract(epoch FROM coalesce(j.finished_at, now()) - j.started_at) - j.paused_seconds
            - CASE WHEN j.paused_at IS NOT NULL AND j.finished_at IS NULL
                   THEN extract(epoch FROM now() - greatest(j.paused_at, j.started_at))
                   ELSE 0 END) END AS active_seconds
-FROM jobs j WHERE j.id = ANY(:ids)
+FROM jobs j LEFT JOIN counts c ON c.job_id = j.id
+WHERE j.id = ANY(:ids)
 """)
 
 
@@ -624,7 +638,8 @@ async def cancel_job(
 
 _RATE = text("""
 SELECT count(*) FILTER (WHERE NOT from_cache) AS fetched,
-       count(*) FILTER (WHERE from_cache) AS cached
+       extract(epoch FROM max(finished_at) FILTER (WHERE NOT from_cache)
+                      - min(finished_at) FILTER (WHERE NOT from_cache)) AS span_s
 FROM job_domains
 WHERE state = 'done' AND finished_at >= now() - interval '15 minutes'
 """)
@@ -661,7 +676,10 @@ async def estimate(
     fetched = int(rate["fetched"] or 0)
     others = int(await session.scalar(_OTHERS, {"me": str(who.user_id) if who.user_id else "admin"}) or 0)
     if fetched >= MIN_SAMPLE:
-        total_rate = fetched / ESTIMATE_WINDOW_MIN
+        # Over the span the worker was actually finishing domains, not the whole
+        # window: 40 domains done 14 minutes ago is not a crawler doing 3 a minute.
+        span_min = max(1.0, float(rate["span_s"] or 0) / 60)
+        total_rate = fetched / span_min
         basis = "recent"
     else:
         total_rate = settings.typical_domains_per_minute
@@ -669,9 +687,8 @@ async def estimate(
     my_rate = total_rate / (others + 1)
     minutes = domains / my_rate if my_rate > 0 else None
 
-    from app.providers import provider_status
+    from app.providers import cached_jina_status
 
-    vendors = await provider_status(session)
     return {
         "domains": domains,
         "basis": basis,
@@ -681,7 +698,9 @@ async def estimate(
         "eta_seconds": None if minutes is None else {
             "low": round(minutes * 60 * 0.7), "high": round(minutes * 60 * 1.4),
         },
-        "blocked_by": "jina_credit" if vendors["jina"]["status"] == "empty" else None,
+        # From the cached provider check only: an estimate per keystroke must never
+        # wait on (or hammer) Jina's API.
+        "blocked_by": "jina_credit" if cached_jina_status() == "empty" else None,
     }
 
 
@@ -713,20 +732,26 @@ async def get_provider_keys(
 
     await provider_keys.refresh(session, force=True)
     return {"keys": provider_keys.describe(),
-            "can_save": bool(settings.provider_key_encryption_key)}
+            "can_save": bool(settings.provider_key_encryption_key),
+            # What each process is really using: a worker that cannot decrypt a saved
+            # key shows here as "unreadable" instead of silently using another key.
+            "processes": await provider_keys.processes(session),
+            "audit": await provider_keys.recent_audit(session)}
 
 
 @app.put("/providers/keys/{name}")
 async def put_provider_key(
     name: str,
     body: ProviderKeyBody,
+    request: Request,
     who: Principal = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Check the key with the provider, then save it encrypted. A Jina key with credit
-    also resumes the jobs that paused because Jina ran out."""
+    """Check the key with the provider, then save it encrypted. A Jina key with enough
+    credit also resumes the jobs that paused because Jina ran out."""
     _require_admin(who)
     provider = _provider(name)
+    _limit_key_changes(who)
     from app import provider_keys, providers
 
     async with httpx.AsyncClient(timeout=providers.TIMEOUT_S) as client:
@@ -744,12 +769,13 @@ async def put_provider_key(
                 raise ApiError("invalid_provider_key", "TypeSafe could not be reached to check "
                                "this key; try again", status=503, retry_after=30)
     try:
-        await provider_keys.save(session, provider, body.key, who.name)
+        await provider_keys.save(session, provider, body.key, who.name,
+                                 getattr(request.state, "request_id", None))
     except provider_keys.KeyStoreUnavailable as e:
         raise ApiError("key_store_unavailable", str(e)) from e
     providers.reset_cache()
     resumed = 0
-    if provider == "jina" and balance is not None and balance > 0:
+    if provider == "jina" and balance is not None and balance >= settings.jina_resume_min_tokens:
         resumed = await _resume_paused_for(session, "jina_account")
     log.info("provider_key_saved", extra={"provider": provider, "by": who.name,
                                           "resumed_jobs": resumed})
@@ -760,17 +786,37 @@ async def put_provider_key(
 @app.delete("/providers/keys/{name}")
 async def delete_provider_key(
     name: str,
+    request: Request,
     who: Principal = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Forget the portal-set key; the environment's key (if any) applies again."""
     _require_admin(who)
     provider = _provider(name)
+    _limit_key_changes(who)
     from app import provider_keys, providers
 
-    await provider_keys.clear(session, provider)
+    await provider_keys.clear(session, provider, who.name,
+                              getattr(request.state, "request_id", None))
+    log.info("provider_key_removed", extra={"provider": provider, "by": who.name})
     providers.reset_cache()
     return {"provider": provider, **provider_keys.describe()[provider]}
+
+
+KEY_CHANGES_PER_MINUTE = 10
+_key_changes: dict[str, list[float]] = {}
+
+
+def _limit_key_changes(who: Principal) -> None:
+    """Every key change is checked against a provider; also for admins (whose other
+    requests are not rate-limited), so the endpoint cannot be used to try keys in bulk."""
+    now = time.monotonic()
+    recent = [t for t in _key_changes.get(who.name, []) if now - t < 60]
+    if len(recent) >= KEY_CHANGES_PER_MINUTE:
+        raise ApiError("key_rate_limited", "too many key changes; wait a minute",
+                       retry_after=int(60 - (now - recent[0])) + 1)
+    recent.append(now)
+    _key_changes[who.name] = recent
 
 
 async def _resume_paused_for(session: AsyncSession, reason: str) -> int:

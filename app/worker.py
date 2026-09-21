@@ -59,6 +59,7 @@ class Worker:
         try:
             from app import provider_keys
 
+            provider_keys.set_process_name("worker")
             async with self.sessions() as s:
                 await provider_keys.refresh(s, force=True)
         except Exception:  # noqa: BLE001 - fall back to the environment's keys
@@ -133,10 +134,14 @@ class Worker:
             try:
                 async with self.sessions() as s:
                     await queue.heartbeat(s, self.id)
+            except Exception:  # noqa: BLE001
+                log.exception("heartbeat_failed")
+            try:
+                async with self.sessions() as s:
                     # Keys saved from the portal take effect here without a redeploy.
                     await provider_keys.refresh(s)
             except Exception:  # noqa: BLE001
-                log.exception("heartbeat_failed")
+                log.exception("provider_key_refresh_failed")
 
     async def _reap_loop(self) -> None:
         while True:
@@ -192,11 +197,23 @@ class Worker:
                 await self._finish(s, job, c, cached, from_cache=True)
                 return
 
+        from app import provider_keys
+
+        key_before = provider_keys.current("jina")
         try:
             result = await process_domain(c.domain, self.fetcher)
         except FetchError as e:
             if e.error_class is not ErrorClass.PROVIDER_ACCOUNT:
                 raise
+            # An admin may have just saved a new key that this process has not picked
+            # up yet. Pausing now would undo the resume that saving it triggered, so
+            # reload first and, if the key changed, simply retry this domain with it.
+            async with self.sessions() as s:
+                await provider_keys.refresh(s, force=True)
+                if provider_keys.current("jina") != key_before:
+                    await queue.unlock_domain(s, c)
+                    await queue.requeue(s, c, 0, count_attempt=False)
+                    return
             reason = f"{settings.fetch_backend}_account"
             log.error("jobs_paused", extra={"reason": reason, "detail": str(e)})
             async with self.sessions() as s:

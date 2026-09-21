@@ -38,7 +38,7 @@ async def db(monkeypatch):
 
     monkeypatch.setattr(settings, "database_url", TEST_DB)
     async with db_module.get_sessionmaker()() as s:
-        await s.execute(text("TRUNCATE jobs, job_items, job_domains, domains, pages, users CASCADE"))
+        await s.execute(text("TRUNCATE jobs, job_items, job_domains, domains, pages, users, provider_keys, provider_key_audit, process_status CASCADE"))
         await s.commit()
     yield db_module.get_sessionmaker()
     await db_module.dispose_engine()
@@ -1065,3 +1065,167 @@ async def test_a_job_with_more_than_32767_domains_is_created(db):
         n = await s.scalar(text("SELECT count(*) FROM job_domains WHERE job_id = :j"),
                            {"j": job.id})
     assert n == 40_000
+
+
+# --- key store hardening ---------------------------------------------------
+
+
+def _new_master(monkeypatch):
+    import base64
+    import os as _os
+
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "provider_key_encryption_key",
+                        base64.b64encode(_os.urandom(32)).decode())
+
+
+async def test_an_undecryptable_saved_key_fails_closed_not_to_the_env_key(db, monkeypatch):
+    from app import provider_keys
+    from app.settings import settings
+
+    provider_keys.reset_for_tests()
+    monkeypatch.setattr(settings, "jina_api_key", "old_env_key_that_leaked")
+    _new_master(monkeypatch)
+    async with db() as s:
+        await provider_keys.save(s, "jina", "new_portal_key_9999", "boss@x.com")
+    assert provider_keys.current("jina") == "new_portal_key_9999"
+    _new_master(monkeypatch)                       # this process now has the wrong master key
+    async with db() as s:
+        await provider_keys.refresh(s, force=True)
+    assert provider_keys.current("jina") == ""     # not the leaked environment key
+    assert provider_keys.source("jina") == "unreadable"
+    assert provider_keys.describe()["jina"]["decrypt_failed"] is True
+    provider_keys.reset_for_tests()
+
+
+async def test_key_changes_are_audited_and_processes_report_what_they_use(db, monkeypatch, api_key):
+    import httpx
+
+    from app import provider_keys, providers
+    from app.main import app
+
+    provider_keys.reset_for_tests()
+    _new_master(monkeypatch)
+
+    async def ok_status(client, key):
+        return "ok"
+
+    monkeypatch.setattr(providers, "typesafe_key_status", ok_status)
+    provider_keys.set_process_name("api")
+    h = {"X-API-Key": api_key, "X-Request-ID": "req-audit-1"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.put("/providers/keys/typesafe", json={"key": "ts_new_key_abcd"},
+                            headers=h)).status_code == 200
+        assert (await c.delete("/providers/keys/typesafe", headers=h)).status_code == 200
+        body = (await c.get("/providers/keys", headers=h)).json()
+    actions = [(a["provider"], a["action"], a["last4"]) for a in body["audit"]]
+    assert actions[:2] == [("typesafe", "removed", None), ("typesafe", "saved", "abcd")]
+    assert body["processes"]["api"]["typesafe"]["source"] in ("environment", "none")
+    async with db() as s:
+        rid = await s.scalar(text("SELECT request_id FROM provider_key_audit WHERE action='saved'"))
+    assert rid == "req-audit-1"
+    provider_keys.reset_for_tests()
+
+
+async def test_key_changes_are_rate_limited_even_for_admins(db, monkeypatch, api_key):
+    import httpx
+
+    from app import main as main_mod
+    from app import providers
+    from app.main import app
+
+    _new_master(monkeypatch)
+    main_mod._key_changes.clear()
+
+    async def rejected(client, key):
+        return "rejected"
+
+    monkeypatch.setattr(providers, "typesafe_key_status", rejected)
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        codes = [(await c.put("/providers/keys/typesafe", json={"key": f"probe_key_{i:04d}"},
+                              headers=h)).status_code for i in range(12)]
+    assert codes[:10] == [422] * 10 and codes[10:] == [429, 429]
+    main_mod._key_changes.clear()
+
+
+async def test_a_nearly_empty_jina_key_does_not_resume_jobs(db, monkeypatch, api_key):
+    import httpx
+
+    from app import main as main_mod
+    from app import provider_keys, providers, queue
+    from app.main import app
+
+    provider_keys.reset_for_tests()
+    _new_master(monkeypatch)
+    main_mod._key_changes.clear()
+
+    async def low(client, key):
+        return 5_000_000                                  # under JINA_RESUME_MIN_TOKENS
+
+    monkeypatch.setattr(providers, "jina_balance", low)
+    job = await make_job(db, ["low1.com"])
+    async with db() as s:
+        await queue.pause_active_jobs(s, "jina_account")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.put("/providers/keys/jina", json={"key": "jina_low_key_1111"},
+                        headers={"X-API-Key": api_key})
+    assert r.status_code == 200 and r.json()["resumed_jobs"] == 0
+    async with db() as s:
+        assert await job_status(s, job.id) == "paused"
+    provider_keys.reset_for_tests()
+
+
+async def test_estimate_uses_the_active_span_not_the_whole_window(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    job = await make_job(db, [f"span{i}.com" for i in range(40)])
+    async with db() as s:
+        # 40 domains finished within one minute, fourteen minutes ago; idle since.
+        await s.execute(text("""
+            UPDATE job_domains SET state = 'done', status = 'found', jina_tokens = 10,
+                finished_at = now() - interval '14 minutes'
+                              + (random() * interval '60 seconds')
+            WHERE job_id = :j
+        """), {"j": job.id})
+        await s.execute(text("UPDATE jobs SET status = 'done'"))
+        await s.commit()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        e = (await c.get("/estimate?domains=4000", headers={"X-API-Key": api_key})).json()
+    assert e["basis"] == "recent" and e["rate_per_minute"] >= 35       # not 40/15 = 2.7
+
+
+async def test_worker_retries_with_a_newly_saved_key_instead_of_pausing(db, monkeypatch):
+    from app import provider_keys
+    from app import worker as worker_mod
+    from app.pipeline.fetch import ErrorClass, FetchError
+    from app.schemas import DomainResult
+
+    provider_keys.reset_for_tests()
+    _new_master(monkeypatch)
+    calls = []
+
+    async def first_402_then_ok(domain, fetcher=None):
+        calls.append(domain)
+        if len(calls) == 1:
+            # An admin saves a new key while this request is failing with the old one.
+            async with db() as s:
+                await provider_keys.save(s, "jina", "fresh_key_after_topup_1", "boss@x.com")
+            provider_keys.reset_for_tests()            # this process has not seen it yet
+            raise FetchError(ErrorClass.PROVIDER_ACCOUNT, "provider_account", detail="402")
+        return DomainResult(domain=domain, status="found", best_email=f"a@{domain}")
+
+    monkeypatch.setattr(worker_mod, "process_domain", first_402_then_ok)
+    job = await make_job(db, ["retry-key.com"])
+
+    async def done(s):
+        return await job_status(s, job.id) == "done"
+
+    await run_until(db, done)
+    assert len(calls) == 2
+    async with db() as s:
+        assert await s.scalar(text("SELECT count(*) FROM jobs WHERE status = 'paused'")) == 0
+    provider_keys.reset_for_tests()

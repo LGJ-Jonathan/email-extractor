@@ -24,6 +24,10 @@ REFRESH_S = 30
 
 _keys: dict[str, str] = {}          # provider -> key saved in the database
 _meta: dict[str, dict] = {}         # provider -> {last4, updated_by, updated_at}
+# Providers with a saved key this process could not decrypt (wrong or missing master
+# key, tampered row). They get NO key -- never the environment's. Falling back let a
+# worker keep crawling with a key an admin had just replaced because it was leaked.
+_failed: set[str] = set()
 _loaded_at = 0.0
 _lock = asyncio.Lock()
 
@@ -61,13 +65,18 @@ def decrypt(provider: str, ciphertext: str, nonce: str) -> str:
 
 
 def current(provider: str) -> str:
-    """The key to use now: the portal-set one if there is one, else the environment's."""
+    """The key to use now: the portal-set one if there is one, else the environment's.
+    Empty when a saved key exists but cannot be decrypted here (fail closed)."""
+    if provider in _failed:
+        return ""
     if provider in _keys:
         return _keys[provider]
     return settings.jina_api_key if provider == "jina" else settings.typesafe_api_key
 
 
 def source(provider: str) -> str:
+    if provider in _failed:
+        return "unreadable"
     if provider in _keys:
         return "portal"
     return "environment" if current(provider) else "none"
@@ -80,7 +89,8 @@ def describe() -> dict:
         meta = _meta.get(p, {})
         out[p] = {
             "source": source(p),
-            "last4": meta.get("last4") if p in _keys else (key[-4:] if key else None),
+            "decrypt_failed": p in _failed,
+            "last4": meta.get("last4") if (p in _keys or p in _failed) else (key[-4:] if key else None),
             "updated_by": meta.get("updated_by"),
             "updated_at": meta.get("updated_at"),
         }
@@ -96,25 +106,84 @@ async def refresh(session: AsyncSession, *, force: bool = False) -> None:
         rows = (await session.execute(text(
             "SELECT provider, ciphertext, nonce, last4, updated_by, updated_at FROM provider_keys"
         ))).all()
-        keys, meta = {}, {}
+        keys, meta, failed = {}, {}, set()
         for r in rows:
+            meta[r.provider] = {"last4": r.last4, "updated_by": r.updated_by,
+                                "updated_at": r.updated_at.isoformat() if r.updated_at else None}
             try:
                 keys[r.provider] = decrypt(r.provider, r.ciphertext, r.nonce)
             except KeyStoreUnavailable as e:
+                failed.add(r.provider)
                 log.error("provider_key_unavailable", extra={"provider": r.provider,
                                                              "err": str(e)})
-                continue
             except Exception:  # noqa: BLE001 - wrong master key or tampered row
+                failed.add(r.provider)
                 log.error("provider_key_decrypt_failed", extra={"provider": r.provider})
-                continue
-            meta[r.provider] = {"last4": r.last4, "updated_by": r.updated_by,
-                                "updated_at": r.updated_at.isoformat() if r.updated_at else None}
         _keys.clear(); _keys.update(keys)
         _meta.clear(); _meta.update(meta)
+        _failed.clear(); _failed.update(failed)
         _loaded_at = time.monotonic()
+        if _process_name:
+            await _report(session)
 
 
-async def save(session: AsyncSession, provider: str, secret: str, who: str) -> None:
+_process_name: str | None = None
+
+
+def set_process_name(name: str) -> None:
+    """'api' or 'worker': each writes what it is using to process_status on refresh."""
+    global _process_name
+    _process_name = name
+
+
+async def _report(session: AsyncSession) -> None:
+    import json
+
+    status = {p: {"source": source(p), "last4": (current(p) or "")[-4:] or None}
+              for p in PROVIDERS}
+    try:
+        await session.execute(
+            text("""
+                INSERT INTO process_status (name, status, updated_at)
+                VALUES (:n, CAST(:s AS jsonb), now())
+                ON CONFLICT (name) DO UPDATE SET status = CAST(:s AS jsonb), updated_at = now()
+            """),
+            {"n": _process_name, "s": json.dumps(status)},
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 - reporting must never break key loading
+        await session.rollback()
+        log.exception("process_status_report_failed")
+
+
+async def processes(session: AsyncSession) -> dict:
+    rows = await session.execute(text("SELECT name, status, updated_at FROM process_status"))
+    return {r.name: {**r.status, "updated_at": r.updated_at.isoformat()} for r in rows}
+
+
+async def audit(session: AsyncSession, provider: str, action: str, last4: str | None,
+                actor: str, request_id: str | None) -> None:
+    await session.execute(
+        text("""
+            INSERT INTO provider_key_audit (provider, action, last4, actor, request_id)
+            VALUES (:p, :a, :l, :w, :r)
+        """),
+        {"p": provider, "a": action, "l": last4, "w": actor, "r": request_id},
+    )
+
+
+async def recent_audit(session: AsyncSession, limit: int = 10) -> list[dict]:
+    rows = await session.execute(
+        text("SELECT provider, action, last4, actor, at FROM provider_key_audit "
+             "ORDER BY at DESC LIMIT :n"),
+        {"n": limit},
+    )
+    return [{"provider": r.provider, "action": r.action, "last4": r.last4, "actor": r.actor,
+             "at": r.at.isoformat()} for r in rows]
+
+
+async def save(session: AsyncSession, provider: str, secret: str, who: str,
+               request_id: str | None = None) -> None:
     ciphertext, nonce = encrypt(provider, secret)
     await session.execute(
         text("""
@@ -125,16 +194,19 @@ async def save(session: AsyncSession, provider: str, secret: str, who: str) -> N
         """),
         {"p": provider, "c": ciphertext, "n": nonce, "l": secret[-4:], "w": who},
     )
+    await audit(session, provider, "saved", secret[-4:], who, request_id)
     await session.commit()
     await refresh(session, force=True)
 
 
-async def clear(session: AsyncSession, provider: str) -> None:
+async def clear(session: AsyncSession, provider: str, who: str,
+                request_id: str | None = None) -> None:
     await session.execute(text("DELETE FROM provider_keys WHERE provider = :p"), {"p": provider})
+    await audit(session, provider, "removed", None, who, request_id)
     await session.commit()
     await refresh(session, force=True)
 
 
 def reset_for_tests() -> None:
-    global _loaded_at
-    _keys.clear(); _meta.clear(); _loaded_at = 0.0
+    global _loaded_at, _process_name
+    _keys.clear(); _meta.clear(); _failed.clear(); _loaded_at = 0.0; _process_name = None

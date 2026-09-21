@@ -158,6 +158,8 @@ class JobDomain(Base):
         Index("ix_job_domains_job_state_seq", "job_id", "state", "seq"),
         Index("ix_job_domains_done_recent", "job_id", text("finished_at DESC"),
               postgresql_where=text("state = 'done'")),
+        Index("ix_job_domains_done_finished_at", "finished_at",
+              postgresql_where=text("state = 'done'")),
         Index("ix_job_domains_running", "claimed_by", postgresql_where=text("state = 'running'")),
     )
 
@@ -248,6 +250,36 @@ class ProviderKey(Base):
     nonce: Mapped[str] = mapped_column(Text, nullable=False)
     last4: Mapped[str] = mapped_column(Text, nullable=False)
     updated_by: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ProviderKeyAudit(Base):
+    """Every provider key saved or removed from the portal: who, when, last four."""
+
+    __tablename__ = "provider_key_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    last4: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (Index("ix_provider_key_audit_at", "at"),)
+
+
+class ProcessStatus(Base):
+    """What a process (api, worker) is using right now; see provider_keys.report()."""
+
+    __tablename__ = "process_status"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    status: Mapped[dict] = mapped_column(JSONB, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

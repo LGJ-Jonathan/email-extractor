@@ -61,6 +61,7 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "service_unavailable": (503, "the database or queue is unreachable"),
     "busy": (503, "other large uploads are being processed; retry shortly"),
     "invalid_provider_key": (422, "the provider rejected this key"),
+    "key_rate_limited": (429, "too many key changes; wait a minute"),
     "key_store_unavailable": (503, "PROVIDER_KEY_ENCRYPTION_KEY is not configured"),
 }
 
@@ -164,7 +165,9 @@ def _is_outage(exc: BaseException) -> bool:
     # bug, not an outage. Only the connection-specific subclasses below mean "down".
     if isinstance(exc, (OperationalError, PoolTimeout, ConnectionError, socket.gaierror)):
         return True
-    if isinstance(exc, InterfaceError) and _is_connection_error(getattr(exc, "orig", None)):
+    # SQLAlchemy wraps asyncpg errors in DBAPIError subclasses (InterfaceError,
+    # generic DBAPIError for PostgresError); the asyncpg error is exc.orig.__cause__.
+    if isinstance(exc, DBAPIError) and _is_connection_error(getattr(exc, "orig", None)):
         return True
     try:
         import asyncpg

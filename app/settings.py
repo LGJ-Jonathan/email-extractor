@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     jina_timeout_s: int = 10
     # base64 of 32 random bytes; required to save provider keys from the portal.
     provider_key_encryption_key: str = ""
+    # Saving a Jina key resumes jobs paused for Jina credit only above this balance;
+    # a key with a few tokens left would resume them just to pause again. ~400 domains.
+    jina_resume_min_tokens: int = 10_000_000
     # Below this the portal shows Jina credit as "low". A 50k-row job spends ~1.3B.
     jina_low_balance_tokens: int = 100_000_000
     # "redis" shares one Jina budget across the API and every worker process. "local"
@@ -111,7 +114,8 @@ class Settings(BaseSettings):
     # Estimates before a job starts: the recent fetch rate when there is enough of it,
     # else this. Measured ~45/min on the 16k-domain run at JINA_RPM=500.
     typical_domains_per_minute: float = 40.0
-    upload_wait_s: int = 60             # one 50k-row job takes ~20 s to create
+    # Waiting + creating (~20 s, more under load) must stay inside the portal's 90 s.
+    upload_wait_s: int = 40
     webhook_timeout_s: int = 10
     webhook_secret: str = ""             # set to HMAC-sign deliveries
     allow_http_webhooks: bool = False    # plain http leaks results in transit

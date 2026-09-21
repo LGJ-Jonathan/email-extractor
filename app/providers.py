@@ -103,6 +103,11 @@ async def provider_status(session: AsyncSession) -> dict:
     }
 
 
+def cached_jina_status() -> str:
+    """The last known Jina status, without calling Jina."""
+    return (_cache[1]["jina"]["status"] if _cache else "unknown")
+
+
 def reset_cache() -> None:
     global _cache
     _cache = None
