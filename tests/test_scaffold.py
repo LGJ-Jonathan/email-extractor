@@ -93,6 +93,8 @@ def test_job_routes_require_the_api_key():
     assert client.get("/jobs/abc").status_code == 401
     assert client.get("/jobs/abc/results.csv").status_code == 401
     assert client.post("/jobs/abc/resume").status_code == 401
+    assert client.post("/jobs/abc/cancel").status_code == 401
+    assert client.get("/jobs").status_code == 401
 
 
 def test_csv_row_shapes():
@@ -144,8 +146,7 @@ def test_pending_is_not_a_valid_domain_result_status():
         DomainResult(domain="acme.com", status="pending")
 
 
-def test_worker_settings_have_at_least_one_function():
-    """arq refuses to construct a Worker with no functions and no cron jobs."""
-    from app.worker import WorkerSettings
+def test_worker_module_imports():
+    from app.worker import Worker, main
 
-    assert WorkerSettings.functions
+    assert callable(main) and Worker

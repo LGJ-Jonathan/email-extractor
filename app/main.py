@@ -1,35 +1,43 @@
 """FastAPI app (spec sections 5 and 14)."""
 
 import logging
-import secrets
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jobs as jobs_svc
+from app import queue
+from app.auth import Principal, require_api_key
 from app.db import dispose_engine, get_session
 from app.ingest import IngestError, detect_column, parse_bytes, preview
 from app.models import Job
+from app.pipeline.fetch import build_fetcher
 from app.pipeline.run import process_input
 from app.schemas import MAX_ITEMS_PER_JOB, CreateJobRequest, DomainResult, ExtractRequest
 from app.settings import settings
 from app.upload_page import UPLOAD_PAGE
+from app.webhook import valid_webhook_url
 
 logging.basicConfig(level=settings.log_level)
 log = logging.getLogger("email_extractor")
 
 
-async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    # compare_digest raises TypeError on non-ASCII str; Starlette decodes headers as
-    # latin-1, so any byte >= 0x80 would otherwise surface as an unauthenticated 500.
-    if not x_api_key or not secrets.compare_digest(
-        x_api_key.encode("utf-8"), settings.api_key.encode("utf-8")
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+ACTIVE_STATUSES = ("queued", "running", "paused")
+
+# One fetcher for the process, so /extract calls share one gate (bucket, breaker,
+# concurrency) instead of each building an unlimited one.
+_fetcher = None
+
+
+def _get_fetcher():
+    global _fetcher
+    if _fetcher is None:
+        _fetcher = build_fetcher()
+    return _fetcher
 
 
 @asynccontextmanager
@@ -64,7 +72,7 @@ async def upload_page() -> str:
 
 @app.post("/extract", response_model=DomainResult, dependencies=[Depends(require_api_key)])
 async def extract(req: ExtractRequest) -> DomainResult:
-    return await process_input(req.url)
+    return await process_input(req.url, _get_fetcher())
 
 
 # --- jobs -----------------------------------------------------------------
@@ -87,9 +95,10 @@ async def jobs_preview(file: UploadFile = File(...)) -> dict:
     return {"filename": filename, **preview(parsed, guess)}
 
 
-@app.post("/jobs", dependencies=[Depends(require_api_key)])
+@app.post("/jobs")
 async def create_job(
     request: Request,
+    who: Principal = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
     file: UploadFile | None = File(default=None),
     column: str | None = Form(default=None),
@@ -124,6 +133,20 @@ async def create_job(
         raise HTTPException(status_code=413, detail=f"max {MAX_ITEMS_PER_JOB:,} rows")
     if not items:
         raise HTTPException(status_code=422, detail="no rows")
+    if not valid_webhook_url(webhook_url):
+        raise HTTPException(status_code=422, detail="webhook_url must be http(s)")
+    if not who.is_admin:
+        active = await session.scalar(
+            select(func.count()).select_from(Job).where(
+                Job.owner_id == who.user_id, Job.status.in_(ACTIVE_STATUSES)
+            )
+        )
+        if active >= settings.max_active_jobs_per_user:
+            raise HTTPException(
+                status_code=429,
+                detail=f"you already have {active} unfinished jobs "
+                       f"(max {settings.max_active_jobs_per_user}); wait or cancel one",
+            )
 
     job, to_run, cached = await jobs_svc.create_job(
         session, items,
@@ -132,8 +155,8 @@ async def create_job(
         website_column=chosen,
         webhook_url=webhook_url,
         fresh=fresh,
+        owner_id=who.user_id,
     )
-    await _enqueue(job, to_run)
     return {
         "job_id": str(job.id),
         "total": len(items),
@@ -143,34 +166,25 @@ async def create_job(
     }
 
 
-async def _enqueue(job: Job, domains: list[str]) -> None:
-    """Hand the domains to arq. A deterministic job id makes re-enqueue a no-op."""
-    try:
-        from arq import create_pool
-        from arq.connections import RedisSettings
-
-        pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-        for d in domains:
-            await pool.enqueue_job("run_domain", d, str(job.id), _job_id=f"d:{d}")
-        await pool.close()
-    except Exception as e:  # noqa: BLE001 - the job row exists; a worker can pick it up
-        log.error("enqueue_failed", extra={"job_id": str(job.id), "err": type(e).__name__})
-
-
-async def _get_job(session: AsyncSession, job_id: str) -> Job:
+async def _get_job(session: AsyncSession, job_id: str, who: Principal) -> Job:
+    """404, not 403, for someone else's job: do not confirm that it exists."""
     try:
         parsed_id = uuid.UUID(job_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail="unknown job") from e
     job = await session.scalar(select(Job).where(Job.id == parsed_id))
-    if job is None:
+    if job is None or not (who.is_admin or job.owner_id == who.user_id):
         raise HTTPException(status_code=404, detail="unknown job")
     return job
 
 
-@app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])
-async def get_job(job_id: str, session: AsyncSession = Depends(get_session)) -> dict:
-    job = await _get_job(session, job_id)
+@app.get("/jobs/{job_id}")
+async def get_job(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    job = await _get_job(session, job_id, who)
     counts = await jobs_svc.job_counts(session, job.id)
     return {
         "job_id": str(job.id),
@@ -178,22 +192,29 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)) -> 
         "paused": job.status == "paused",
         "pause_reason": job.pause_reason,
         "filename": job.filename,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         **counts,
     }
 
 
-@app.get("/jobs/{job_id}/results.csv", dependencies=[Depends(require_api_key)])
-async def results_csv(job_id: str, session: AsyncSession = Depends(get_session)):
-    job = await _get_job(session, job_id)
+@app.get("/jobs/{job_id}/results.csv")
+async def results_csv(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+):
+    job = await _get_job(session, job_id, who)
     columns = list(job.columns or ["website"])
 
     async def gen():
         # UTF-8 BOM so Excel opens it correctly (spec 14).
         yield "﻿"
         yield jobs_svc.csv_line(jobs_svc.output_header(columns))
-        async for raw_row, result, pending in jobs_svc.stream_rows(session, job):
+        async for raw_row, result, pending, retrying in jobs_svc.stream_rows(session, job):
             yield jobs_svc.csv_line(
-                jobs_svc.output_row(columns, raw_row, result, pending_domain=pending)
+                jobs_svc.output_row(columns, raw_row, result, pending_domain=pending,
+                                    retrying=retrying)
             )
 
     name = (job.filename or "results").rsplit(".", 1)[0]
@@ -204,14 +225,19 @@ async def results_csv(job_id: str, session: AsyncSession = Depends(get_session))
     )
 
 
-@app.get("/jobs/{job_id}/results.json", dependencies=[Depends(require_api_key)])
-async def results_json(job_id: str, session: AsyncSession = Depends(get_session)):
-    job = await _get_job(session, job_id)
+@app.get("/jobs/{job_id}/results.json")
+async def results_json(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+):
+    job = await _get_job(session, job_id, who)
     columns = list(job.columns or ["website"])
 
     async def gen():
-        async for raw_row, result, pending in jobs_svc.stream_rows(session, job):
-            yield jobs_svc.json_line(columns, raw_row, result, pending_domain=pending)
+        async for raw_row, result, pending, retrying in jobs_svc.stream_rows(session, job):
+            yield jobs_svc.json_line(columns, raw_row, result, pending_domain=pending,
+                                     retrying=retrying)
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -219,12 +245,62 @@ async def results_json(job_id: str, session: AsyncSession = Depends(get_session)
 # --- operator endpoints (spec 17) ----------------------------------------
 
 
-@app.post("/jobs/{job_id}/resume", dependencies=[Depends(require_api_key)])
-async def resume_job(job_id: str, session: AsyncSession = Depends(get_session)) -> dict:
-    job = await _get_job(session, job_id)
+@app.post("/jobs/{job_id}/resume")
+async def resume_job(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    job = await _get_job(session, job_id, who)
     if job.status != "paused":
         raise HTTPException(status_code=409, detail=f"job is {job.status}, not paused")
     job.status = "running"
     job.pause_reason = None
     await session.commit()
+    # Everything may have finished before the pause landed.
+    await queue.complete_if_finished(session, job.id)
+    await session.refresh(job)
     return {"job_id": str(job.id), "status": job.status}
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Stop claiming this job's domains. Domains already in flight finish normally."""
+    job = await _get_job(session, job_id, who)
+    if job.status not in ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"job is already {job.status}")
+    job.status = "failed"
+    job.pause_reason = "cancelled"
+    await session.commit()
+    return {"job_id": str(job.id), "status": job.status}
+
+
+@app.get("/jobs")
+async def list_jobs(
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """The caller's 50 most recent jobs (an admin sees everyone's)."""
+    stmt = select(Job).order_by(Job.created_at.desc()).limit(50)
+    if not who.is_admin:
+        stmt = stmt.where(Job.owner_id == who.user_id)
+    jobs = list(await session.scalars(stmt))
+    return {
+        "user": who.name,
+        "jobs": [
+            {
+                "job_id": str(j.id),
+                "status": j.status,
+                "pause_reason": j.pause_reason,
+                "filename": j.filename,
+                "total": j.total,
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+                "finished_at": j.finished_at.isoformat() if j.finished_at else None,
+            }
+            for j in jobs
+        ],
+    }

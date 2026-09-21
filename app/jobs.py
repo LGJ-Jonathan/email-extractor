@@ -12,12 +12,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ingest import ColumnGuess, ParsedFile, normalize_column
-from app.models import Domain, Job, JobItem
+from app.models import Domain, Job, JobDomain, JobItem
 from app.pipeline.normalize import normalize_input
 from app.schemas import DomainResult
 from app.settings import settings
@@ -191,8 +191,14 @@ async def create_job(
     website_column: str | None = None,
     webhook_url: str | None = None,
     fresh: bool = False,
+    owner_id: uuid.UUID | None = None,
 ) -> tuple[Job, list[str], list[str]]:
-    """Persist the job and its rows. Returns (job, domains_to_run, cached_domains)."""
+    """Persist the job, its rows and its queue entries.
+
+    Returns (job, domains_to_run, cached_domains). Every unique domain is queued, cached
+    or not: the worker resolves a cache hit in one query, and doing it there means a
+    cache hit gets the same webhook as a fetch.
+    """
     job = Job(
         id=uuid.uuid4(),
         status="queued",
@@ -201,6 +207,8 @@ async def create_job(
         filename=filename,
         columns=source_columns,
         website_column=website_column,
+        fresh=fresh,
+        owner_id=owner_id,
     )
     session.add(job)
     await session.flush()
@@ -222,27 +230,59 @@ async def create_job(
     domains = unique_domains(items)
     cached: list[str] = []
     if domains and not fresh:
-        cutoff = cache_cutoff()
         rows = await session.execute(
             select(Domain.domain).where(
                 Domain.domain.in_(domains),
                 Domain.finished_at.is_not(None),
-                Domain.finished_at >= cutoff,
+                Domain.finished_at >= cache_cutoff(),
                 Domain.status != "fetch_failed",
             )
         )
         cached = [r[0] for r in rows]
 
-    to_run = [d for d in domains if d not in set(cached)]
-    if to_run:
+    if domains:
         # Idempotent: a domain already known stays put, a new one starts pending.
-        await session.execute(
-            pg_insert(Domain)
-            .values([{"domain": d, "stage": "pending"} for d in to_run])
-            .on_conflict_do_nothing(index_elements=[Domain.domain])
-        )
+        for chunk in _chunks(domains, 5000):
+            await session.execute(
+                pg_insert(Domain)
+                .values([{"domain": d, "stage": "pending"} for d in chunk])
+                .on_conflict_do_nothing(index_elements=[Domain.domain])
+            )
+        seq = 0
+        for chunk in _chunks(domains, 5000):
+            await session.execute(
+                pg_insert(JobDomain).values(
+                    [{"job_id": job.id, "domain": d, "seq": seq + i} for i, d in enumerate(chunk)]
+                )
+            )
+            seq += len(chunk)
+    else:
+        job.status = "done"                  # every row was invalid_input
+        job.finished_at = datetime.now(UTC)
     await session.commit()
-    return job, to_run, cached
+    cached_set = set(cached)
+    return job, [d for d in domains if d not in cached_set], cached
+
+
+def _chunks(seq: list, n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+_COUNTS = text("""
+SELECT
+    count(*) AS unique_domains,
+    count(*) FILTER (WHERE jd.state = 'done') AS done,
+    count(*) FILTER (WHERE jd.state = 'done' AND d.status = 'found') AS found,
+    count(*) FILTER (WHERE jd.state = 'done' AND d.status = 'fetch_failed') AS failed,
+    count(*) FILTER (WHERE jd.state = 'running') AS running,
+    count(*) FILTER (WHERE jd.state = 'queued' AND jd.attempts > 0) AS retrying,
+    count(*) FILTER (WHERE jd.from_cache) AS cached,
+    coalesce(sum(jd.jina_tokens), 0) AS jina_tokens
+FROM job_domains jd
+LEFT JOIN domains d ON d.domain = jd.domain
+WHERE jd.job_id = :j
+""")
 
 
 async def job_counts(session: AsyncSession, job_id: uuid.UUID) -> dict:
@@ -250,77 +290,45 @@ async def job_counts(session: AsyncSession, job_id: uuid.UUID) -> dict:
     total = await session.scalar(
         select(func.count()).select_from(JobItem).where(JobItem.job_id == job_id)
     )
-    unique = await session.scalar(
-        select(func.count(func.distinct(JobItem.domain))).where(
-            JobItem.job_id == job_id, JobItem.domain.is_not(None)
-        )
-    )
-    finished = await session.scalar(
-        select(func.count(func.distinct(Domain.domain)))
-        .select_from(JobItem)
-        .join(Domain, Domain.domain == JobItem.domain)
-        .where(JobItem.job_id == job_id, Domain.finished_at.is_not(None))
-    )
-    found = await session.scalar(
-        select(func.count(func.distinct(Domain.domain)))
-        .select_from(JobItem)
-        .join(Domain, Domain.domain == JobItem.domain)
-        .where(
-            JobItem.job_id == job_id,
-            Domain.finished_at.is_not(None),
-            Domain.status == "found",
-        )
-    )
-    failed = await session.scalar(
-        select(func.count(func.distinct(Domain.domain)))
-        .select_from(JobItem)
-        .join(Domain, Domain.domain == JobItem.domain)
-        .where(
-            JobItem.job_id == job_id,
-            Domain.finished_at.is_not(None),
-            Domain.status == "fetch_failed",
-        )
-    )
+    r = (await session.execute(_COUNTS, {"j": job_id})).mappings().one()
+    done, found = r["done"] or 0, r["found"] or 0
     return {
         "total": total or 0,
-        "unique_domains": unique or 0,
-        "done": finished or 0,
-        "failed": failed or 0,
-        "found": found or 0,
-        "hit_rate_so_far": (found or 0) / finished if finished else 0.0,
+        "unique_domains": r["unique_domains"] or 0,
+        "done": done,
+        "running": r["running"] or 0,
+        "retrying": r["retrying"] or 0,
+        "failed": r["failed"] or 0,
+        "found": found,
+        "cached": r["cached"] or 0,
+        "jina_tokens": int(r["jina_tokens"] or 0),
+        "hit_rate_so_far": found / done if done else 0.0,
     }
 
 
-async def mark_job_done_if_complete(session: AsyncSession, job_id: uuid.UUID) -> bool:
-    counts = await job_counts(session, job_id)
-    if counts["unique_domains"] and counts["done"] >= counts["unique_domains"]:
-        await session.execute(
-            update(Job)
-            .where(Job.id == job_id, Job.status.in_(("queued", "running")))
-            .values(status="done", finished_at=datetime.now(UTC), done_count=counts["done"])
-        )
-        await session.commit()
-        return True
-    return False
-
-
 async def stream_rows(session: AsyncSession, job: Job):
-    """Yield (raw_row, DomainResult|None, pending_domain) in input order.
+    """Yield (raw_row, DomainResult|None, pending_domain, retrying) in input order.
 
     Uses a server-side cursor: buffering 50k rows plus their jsonb results before the
     first byte defeats the point of streaming.
     """
     stmt = (
-        select(JobItem, Domain)
+        select(JobItem, Domain, JobDomain.state, JobDomain.attempts)
+        .outerjoin(
+            JobDomain,
+            (JobDomain.job_id == JobItem.job_id) & (JobDomain.domain == JobItem.domain),
+        )
         .outerjoin(Domain, Domain.domain == JobItem.domain)
         .where(JobItem.job_id == job.id)
         .order_by(JobItem.row_index)
         .execution_options(yield_per=500)
     )
     seen_results: dict[str, DomainResult] = {}
-    async for item, domain_row in (await session.stream(stmt)):
+    async for item, domain_row, state, attempts in (await session.stream(stmt)):
         result = None
-        if domain_row is not None and domain_row.result:
+        # A domains row can hold an older result (the cache) that this job has not
+        # accepted yet, e.g. a fresh=true job. Only a done queue row is this job's answer.
+        if state == "done" and domain_row is not None and domain_row.result:
             cached = seen_results.get(item.domain)
             if cached is None:
                 try:
@@ -336,4 +344,5 @@ async def stream_rows(session: AsyncSession, job: Job):
                 status="invalid_input",
                 error_reason=item.reason,
             )
-        yield item.raw_row or {}, result, item.domain
+        retrying = result is None and state == "queued" and (attempts or 0) > 0
+        yield item.raw_row or {}, result, item.domain, retrying

@@ -42,7 +42,7 @@ services:
     env_file: .env
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
-      - "8000:8000"
+      - "${BIND_ADDR:-127.0.0.1}:8000:8000"
     volumes:
       - htmldata:/data/html
     depends_on:
@@ -63,7 +63,8 @@ services:
   worker:
     build: .
     env_file: .env
-    command: ["arq", "app.worker.WorkerSettings"]
+    command: ["python", "-m", "app.worker"]
+    stop_grace_period: 30s
     volumes:
       - htmldata:/data/html
     depends_on:

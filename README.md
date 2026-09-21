@@ -10,32 +10,63 @@ page. No email is ever emitted that did not appear in fetched HTML.
 
 ```bash
 cp .env.example .env      # then fill JINA_API_KEY, TYPESAFE_API_KEY, API_KEY
-docker compose up --build
+docker compose up --build -d
+docker compose exec api python -m app.users add "Sam"     # prints Sam's key once
 ```
 
-`api` runs `alembic upgrade head` on start, then serves on :8000.
+`migrate` runs `alembic upgrade head` first; `api` then serves on :8000 and `worker`
+(`python -m app.worker`) processes jobs. The port binds to `127.0.0.1` unless
+`BIND_ADDR` is set in `.env` -- set it to the machine's Tailscale IP to share it with
+the team over the tailnet.
+
+## Users
+
+Each person gets their own key: `python -m app.users add NAME [--admin]`, `list`,
+`revoke NAME`. Only a sha256 of the key is stored. A person sees only their own jobs
+(someone else's job is a 404) and may have `MAX_ACTIVE_JOBS_PER_USER` unfinished jobs
+at once. `API_KEY` from `.env` is the bootstrap admin key and sees every job.
 
 ## API
 
-Every route except `/healthz` requires `X-API-Key: $API_KEY` (401 otherwise).
-`/healthz` is an unauthenticated liveness probe returning a constant — it is what the
-compose healthcheck calls.
+Every route except `/healthz` and `/` requires `X-API-Key` (401 otherwise).
 
-| Route | State |
+| Route | What it does |
 | --- | --- |
-| `POST /extract` | stub (returns `error_reason=pipeline_not_implemented`) — real pipeline in steps 3-7 |
-| `GET /` | upload page — build step 8 (spec §14) |
-| `POST /jobs` | 501 until build step 8 |
-| `POST /jobs/preview` | 501 until build step 8 |
-| `GET /jobs/{id}` | 501 until build step 8 |
-| `GET /jobs/{id}/results.csv` | 501 until build step 8 |
-| `GET /jobs/{id}/results.json` | 501 until build step 8 |
+| `GET /` | upload page (spec §14) |
+| `POST /jobs` | JSON `{"items": [...]}` or a multipart file upload; queues the job |
+| `POST /jobs/preview` | detects the website column; creates nothing |
+| `GET /jobs` | the caller's 50 most recent jobs |
+| `GET /jobs/{id}` | progress: done, running, retrying, found, failed, cached, jina_tokens |
+| `GET /jobs/{id}/results.csv` / `.json` | the uploaded columns plus `ex_*` result columns, in row order; unfinished rows are `pending` |
+| `POST /jobs/{id}/resume` | resume a paused job (e.g. after topping up Jina) |
+| `POST /jobs/{id}/cancel` | stop claiming the job's domains |
+| `POST /extract` | one domain, synchronously |
 
 ```bash
-curl -s localhost:8000/extract \
-  -H "X-API-Key: $API_KEY" -H 'content-type: application/json' \
-  -d '{"url":"acme.com"}'
+curl -s localhost:8000/jobs -H "X-API-Key: $KEY" -F file=@leads.csv
 ```
+
+## How jobs run
+
+The queue is Postgres (`app/queue.py`), not arq. arq is a single FIFO list: a 50k-row
+job queued first would hold every later job until it drained, and one arq job id per
+domain silently dropped the same domain from a second job.
+
+- **Fair sharing.** Each claim goes to the user with the fewest domains in flight,
+  then that user's job with the fewest, then the oldest. Verified live: a 6-row job
+  submitted after a 39-row job took about half the slots and finished in 25s.
+- **Shared domains are fetched once.** A per-claim lock on `domains` makes a second job
+  wait for the first and then read its result; only the job that fetched pays tokens.
+- **Cache.** Results within `CACHE_DAYS` are reused unless the job has `fresh=true`;
+  `fetch_failed` results are never reused from the cache.
+- **Crash safety.** Workers heartbeat every 20s; rows silent for 90s are reaped back to
+  the queue. SIGTERM hands in-flight rows back without spending an attempt.
+- **Jina account errors** (402 etc.) pause every active job with
+  `pause_reason=jina_account` and mark no domain failed. Resume after topping up.
+- **Rate limit.** `RATE_LIMIT_BACKEND=redis` puts the token bucket in Redis, so the API
+  and every worker share one `JINA_RPM`. If Redis is down it falls back to in-process.
+- **Webhook.** Each finished domain is POSTed as `{job_id, row_indexes, result}`,
+  retried after 2s, 8s and 30s.
 
 ## Local dev (no Docker)
 
@@ -45,6 +76,8 @@ uv run pytest
 ```
 
 Point `DATABASE_URL`/`REDIS_URL` at `localhost` instead of the compose hostnames.
+The queue tests need a Postgres they may wipe:
+`TEST_DATABASE_URL=postgresql+asyncpg://.../extractor_test uv run pytest tests/test_queue_pg.py`.
 
 ## Secrets
 
@@ -140,14 +173,12 @@ them, so nothing was wasted except the result.
 | `probes_needed=4` of 5 | an 80% bar to recover, while the breaker opens at a 30% failure rate -- half-open usually failed and reopened at once. That is the oscillation | `probes_needed=3`, plus open windows that double to `max_open_seconds` and reset only after holding closed |
 | `CircuitOpen` ended the domain | provider backpressure was recorded as the domain's own `fetch_failed`, and `max_domain_attempts` / `retry_pass_delay_s` were dead settings | `process_domain` retries the whole domain up to `MAX_DOMAIN_ATTEMPTS`, sleeping out the breaker's remaining window. Each attempt gets its own deadline |
 
-Still open, in rough order of value: `FetchGate.release_domain` is never called, so
-`_per_domain` grows one semaphore per domain (16,261 last run, 50k at target);
-`TokenBucket.acquire` has no fairness or jitter, so 50 waiters wake together and the
-tail feeds `domain_timeout`; the bucket docstring claims a 50-request burst while the
-code computes 10; the bucket, breaker and semaphores are still per worker process, so
-N workers means N x `JINA_RPM` and a trip in one protects none of the others; and
-nothing persists `last_open_reasons`, so a storm can only be reconstructed afterwards
-from CSV row order.
+Still open: the local `TokenBucket.acquire` has no fairness or jitter, so 50 waiters
+wake together and the tail feeds `domain_timeout` (the Redis bucket jitters); the
+breaker and semaphores are per process, which is fine for the one-worker deployment
+but means a second worker process gets its own breaker; and nothing persists
+`last_open_reasons`, so a storm can only be reconstructed afterwards from logs.
+`release_domain` is now called by the worker once a domain finishes.
 
 ## Build progress
 
@@ -160,7 +191,7 @@ Section 15 edge cases are implemented inside the step that owns their stage.
 - [x] 3. Stages 1-2: normalize, DNS, homepage, parked detection, §15 input cases
 - [x] 4. Stage 3: robots, sitemaps, links, scoring, §16 wave 1 + selection shortcut
 - [x] 5. Stages 5-6: extraction, filter/rank, §11 fixtures, §16 wave 2/3 early stop
-- [ ] 6. Eval harness, rules-only baseline
-- [ ] 7. Stage 7: TypeSafe
-- [ ] 8. Jobs API, arq queues, checkpointing, cache, CSV/JSON, webhook, file parsing + column detection + upload page (§14)
-- [ ] 9. 5k soak test, then 50k
+- [x] 6. Eval harness, rules-only baseline
+- [x] 7. Stage 7: TypeSafe
+- [x] 8. Jobs API, Postgres queue (replaces arq), per-user keys, cache, CSV/JSON, webhook, upload page (§14)
+- [ ] 9. 5k soak test through the running service, then 50k

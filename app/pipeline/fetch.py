@@ -507,11 +507,18 @@ class JinaFetcher(_BaseFetcher):
 
 
 def build_gate() -> FetchGate:
+    rpm = settings.jina_rpm if settings.fetch_backend == "jina" else None
+    bucket = None
+    if rpm and settings.rate_limit_backend == "redis":
+        from app.ratelimit import RedisTokenBucket
+
+        bucket = RedisTokenBucket(settings.redis_url, rpm, name=settings.fetch_backend)
     return FetchGate(
-        rate_per_minute=settings.jina_rpm if settings.fetch_backend == "jina" else None,
+        rate_per_minute=rpm,
         global_concurrency=settings.global_fetch_concurrency,
         per_domain_concurrency=settings.per_domain_concurrency,
         provider=settings.fetch_backend,
+        bucket=bucket,
     )
 
 

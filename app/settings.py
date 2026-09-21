@@ -14,7 +14,8 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Auth / infra
+    # Auth / infra. API_KEY is the bootstrap admin key; people get their own keys from
+    # `python -m app.users add NAME`.
     api_key: str = "change-me"
     database_url: str = "postgresql+asyncpg://app:app@postgres:5432/extractor"
     redis_url: str = "redis://redis:6379/0"
@@ -24,6 +25,9 @@ class Settings(BaseSettings):
     jina_api_key: str = ""
     jina_rpm: int = 500
     jina_timeout_s: int = 10
+    # "redis" shares one Jina budget across the API and every worker process. "local"
+    # keeps it in-process, which is right for scripts/eval.py and the tests.
+    rate_limit_backend: Literal["local", "redis"] = "local"
 
     # TypeSafe
     typesafe_api_key: str = ""
@@ -60,6 +64,10 @@ class Settings(BaseSettings):
     max_domain_attempts: int = 3
     retry_pass_delay_s: int = 600        # delay before re-running transient failures (spec 17)
     user_agent: str = "Mozilla/5.0 (compatible; ContactFinder/1.0)"
+
+    # Multi-user
+    max_active_jobs_per_user: int = 3    # queued + running + paused
+    webhook_timeout_s: int = 10
 
     # Debug / ops
     debug_store_html: bool = False

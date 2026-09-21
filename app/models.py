@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Integer,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -33,6 +35,23 @@ domain_stage_enum = Enum(*DOMAIN_STAGES, name="domain_stage")
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    """One per person. Only a sha256 of the key is stored; the key is shown once."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
@@ -60,6 +79,50 @@ class Job(Base):
     columns: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     website_column: Mapped[str | None] = mapped_column(Text, nullable=True)
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Null for jobs created with the bootstrap API_KEY.
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    fresh: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    __table_args__ = (Index("ix_jobs_owner_id_created_at", "owner_id", "created_at"),)
+
+
+class JobDomain(Base):
+    """The work queue: one row per unique domain per job (app/queue.py).
+
+    state is queued -> running -> done. Two jobs sharing a domain each get a row, but
+    only one fetch runs: the other waits on the domain lock and then reads the cache.
+    """
+
+    __tablename__ = "job_domains"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    domain: Mapped[str] = mapped_column(Text, primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="queued",
+                                       server_default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    from_cache: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Tokens THIS job paid for; 0 when it read someone else's result.
+    jina_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index("ix_job_domains_job_state_seq", "job_id", "state", "seq"),
+        Index("ix_job_domains_running", "claimed_by", postgresql_where=text("state = 'running'")),
+    )
 
 
 class JobItem(Base):
@@ -103,6 +166,9 @@ class Domain(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Held by the worker fetching this domain, so two jobs never fetch it at once.
+    lock_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lock_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("ix_domains_finished_at", "finished_at"),)
 

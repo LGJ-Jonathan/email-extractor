@@ -1,9 +1,9 @@
 """Token buckets, circuit breakers and the fetch gate (spec sections 6 Stage 4, 16, 17).
 
-Scope note: this state is per worker process. The spec calls the bucket and the
-breaker "global"; with more than one worker process each gets its own, so the
-effective rate is N x JINA_RPM. Backing these with Redis is a step-8 concern and
-the interfaces here are deliberately narrow so that swap is mechanical.
+Scope note: with RATE_LIMIT_BACKEND=redis the token bucket is shared by the API and
+every worker process (RedisTokenBucket), so N processes still spend one JINA_RPM.
+The breaker and the semaphores stay per process: the compose stack runs one worker
+process, and a trip there protects that process's fetches, which are nearly all of them.
 """
 
 import asyncio
@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 class TokenBucket:
     """Rate limiter measured in requests per minute.
 
-    Capacity defaults to a tenth of the minute budget so a burst cannot spend the
-    whole window at once (at JINA_RPM=500 that is a 50-request burst).
+    Capacity defaults to a fiftieth of the minute budget (at JINA_RPM=500 that is a
+    10-request burst).
     """
 
     def __init__(self, rate_per_minute: int, capacity: int | None = None) -> None:
@@ -63,6 +63,108 @@ class TokenBucket:
     def tokens(self) -> float:
         self._refill()
         return self._tokens
+
+
+# Token bucket in Redis. Clients pass their own clock; every process runs on one host.
+# Returns "0" when the tokens were taken, else the seconds to wait (as a string, since
+# a Lua number would be truncated to an integer on the way out).
+_BUCKET_LUA = """
+local rate = tonumber(ARGV[1])
+local cap = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local n = tonumber(ARGV[4])
+local factor = tonumber(redis.call('GET', KEYS[2]) or '1')
+local r = rate * factor
+local b = redis.call('HMGET', KEYS[1], 't', 'ts')
+local t = tonumber(b[1]) or cap
+local ts = tonumber(b[2]) or now
+if now > ts then
+  t = math.min(cap, t + (now - ts) * r)
+  ts = now
+end
+local wait = 0
+if t >= n then t = t - n else wait = (n - t) / r end
+redis.call('HSET', KEYS[1], 't', tostring(t), 'ts', tostring(ts))
+redis.call('EXPIRE', KEYS[1], 3600)
+return tostring(wait)
+"""
+
+
+class RedisTokenBucket:
+    """TokenBucket semantics with the state in Redis, so every process shares it.
+
+    If Redis is unreachable it falls back to a local bucket rather than stopping all
+    fetching: overspending the rate for a while is recoverable, a dead worker is not.
+    """
+
+    def __init__(self, redis_url: str, rate_per_minute: int, name: str = "jina",
+                 capacity: int | None = None, client=None) -> None:
+        self.rate_per_minute = rate_per_minute
+        self._rate = rate_per_minute / 60.0
+        self._capacity = float(capacity if capacity is not None else max(1, rate_per_minute // 50))
+        self._key = f"ratelimit:{name}:bucket"
+        self._penalty_key = f"ratelimit:{name}:penalty"
+        self._fallback = TokenBucket(rate_per_minute, capacity)
+        self._redis_url = redis_url
+        self._client = client
+        self._script = None
+        self._warned = False
+        self._pending: set[asyncio.Task] = set()
+
+    def _redis(self):
+        if self._client is None:
+            import redis.asyncio as aioredis
+
+            self._client = aioredis.from_url(self._redis_url)
+        if self._script is None:
+            self._script = self._client.register_script(_BUCKET_LUA)
+        return self._script
+
+    async def _try(self, n: int, now: float | None = None) -> float:
+        script = self._redis()
+        raw = await script(
+            keys=[self._key, self._penalty_key],
+            args=[self._rate, self._capacity, time.time() if now is None else now, n],
+        )
+        return float(raw.decode() if isinstance(raw, bytes) else raw)
+
+    async def acquire(self, n: int = 1) -> None:
+        while True:
+            try:
+                wait = await self._try(n)
+            except Exception as e:  # noqa: BLE001 - any Redis failure
+                if not self._warned:
+                    import logging
+
+                    logging.getLogger("email_extractor").warning(
+                        "rate_limit_redis_unavailable", extra={"err": type(e).__name__}
+                    )
+                    self._warned = True
+                await self._fallback.acquire(n)
+                return
+            if wait <= 0:
+                return
+            # Jitter so a crowd of waiters does not come back in lockstep.
+            await asyncio.sleep(min(wait, 5.0) * (1.0 + random.random() * 0.2))
+
+    def penalize(self, fraction: float = 0.25, seconds: float = 60.0) -> None:
+        """Slow every process's bucket after a provider 429 (spec 17, level 1)."""
+        self._fallback.penalize(fraction, seconds)
+        factor = max(0.05, 1.0 - fraction)
+
+        async def _set() -> None:
+            try:
+                self._redis()
+                await self._client.set(self._penalty_key, str(factor), px=int(seconds * 1000))
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            task = asyncio.get_running_loop().create_task(_set())
+        except RuntimeError:
+            return
+        self._pending.add(task)                    # the loop only holds a weak reference
+        task.add_done_callback(self._pending.discard)
 
 
 class CircuitOpen(Exception):
@@ -210,8 +312,9 @@ class FetchGate:
         global_concurrency: int,
         per_domain_concurrency: int,
         provider: str = "jina",
+        bucket: "TokenBucket | RedisTokenBucket | None" = None,
     ) -> None:
-        self.bucket = TokenBucket(rate_per_minute) if rate_per_minute else None
+        self.bucket = bucket or (TokenBucket(rate_per_minute) if rate_per_minute else None)
         self.breaker = CircuitBreaker(provider)
         self._global = asyncio.Semaphore(global_concurrency)
         self._per_domain_limit = per_domain_concurrency
