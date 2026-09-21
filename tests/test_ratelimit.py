@@ -183,3 +183,62 @@ async def test_breaker_still_gives_up_after_the_max_wait():
     with pytest.raises(CircuitOpen):
         async with slot:
             pass
+
+
+# --- recovery bar and escalation (the seven-hour oscillation) -------------
+
+
+def test_half_open_bar_sits_below_the_rate_that_opened_it():
+    """At 4 of 5 the bar to recover was 80% success while the breaker opened at a 30%
+    failure rate, so half-open usually failed and reopened at once."""
+    cb = CircuitBreaker("jina", open_seconds=0.05, min_samples=20)
+    assert cb.probes_needed < cb.probes
+    for _ in range(25):
+        cb.record(False)
+    time.sleep(0.06)
+    assert cb.state == "half_open"
+    for ok in (True, True, True, False, False):    # 3 of 5, the old bar would reopen
+        cb.record(ok)
+    assert cb.state == "closed"
+    assert cb.opened_count == 1
+
+
+def test_repeated_opens_escalate_the_window():
+    cb = CircuitBreaker("jina", open_seconds=0.05, max_open_seconds=0.4, min_samples=20)
+    for _ in range(25):
+        cb.record(False)
+    assert cb.open_for == pytest.approx(0.05)
+
+    for expected in (0.1, 0.2, 0.4, 0.4):          # doubles, then holds at the ceiling
+        time.sleep(cb.open_for + 0.01)
+        assert cb.state == "half_open"
+        for _ in range(cb.probes):
+            cb.record(False)
+        assert cb.open_for == pytest.approx(expected)
+
+
+def test_escalation_resets_once_it_has_held_closed():
+    """Closing and reopening immediately is the same outage; a real recovery is not."""
+    cb = CircuitBreaker(
+        "jina", open_seconds=0.05, min_samples=20, recovery_multiple=1.0
+    )
+    for _ in range(25):
+        cb.record(False)
+    time.sleep(0.06)
+    assert cb.state == "half_open"
+    for _ in range(cb.probes):
+        cb.record(True)
+    assert cb.state == "closed"
+
+    time.sleep(0.08)                               # > open_seconds * recovery_multiple
+    for _ in range(25):
+        cb.record(False)
+    assert cb.open_for == pytest.approx(0.05)      # back to the base window, not doubled
+
+
+def test_seconds_until_close_reports_the_remaining_window():
+    cb = CircuitBreaker("jina", open_seconds=10.0, min_samples=20)
+    assert cb.seconds_until_close() == 0.0
+    for _ in range(25):
+        cb.record(False)
+    assert 9.0 < cb.seconds_until_close() <= 10.0

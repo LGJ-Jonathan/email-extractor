@@ -81,19 +81,37 @@ class CircuitBreaker:
     Opens when more than `threshold` of the last `window` calls failed, stays open
     for `open_seconds`, then admits `probes` calls and closes if `probes_needed`
     of them succeed. `min_samples` stops a handful of early failures opening it.
+
+    `probes_needed` is deliberately BELOW `probes`. At 4 of 5 the bar to recover was
+    80% success, while the thing that opened the breaker was a failure rate over
+    `threshold` -- so half-open usually failed and reopened immediately. Over the
+    16k run that oscillation ran for seven hours: stretches with the breaker quiet
+    found 56-62% of addresses, stretches with it thrashing found 24-33%.
+
+    Repeated opens escalate the window (`open_seconds` doubling up to
+    `max_open_seconds`) so a real outage is waited out once instead of being probed
+    every minute. The escalation resets only after the breaker has held closed for
+    `recovery_multiple` x `open_seconds` -- closing and reopening at once is the
+    same outage continuing, not a recovery.
     """
 
     provider: str
     window: int = 200
     threshold: float = 0.30
     open_seconds: float = 60.0
+    max_open_seconds: float = 300.0
     probes: int = 5
-    probes_needed: int = 4
+    probes_needed: int = 3
     min_samples: int = 20
+    recovery_multiple: float = 4.0
 
     _outcomes: deque[bool] = field(default_factory=deque, init=False)
     _state: str = field(default="closed", init=False)
     _opened_at: float = field(default=0.0, init=False)
+    _closed_at: float = field(default=0.0, init=False)
+    # The CURRENT open window, which escalation grows past `open_seconds`.
+    _open_for: float = field(default=0.0, init=False)
+    _consecutive_opens: int = field(default=0, init=False)
     _probe_results: list[bool] = field(default_factory=list, init=False)
     opened_count: int = field(default=0, init=False)
     # What actually pushed it open, so a trip is diagnosable after the fact.
@@ -102,16 +120,32 @@ class CircuitBreaker:
 
     @property
     def state(self) -> str:
-        if self._state == "open" and time.monotonic() - self._opened_at >= self.open_seconds:
+        if self._state == "open" and time.monotonic() - self._opened_at >= self._open_for:
             self._state = "half_open"
             self._probe_results = []
         return self._state
+
+    @property
+    def open_for(self) -> float:
+        """The current open window, after escalation. For logging."""
+        return self._open_for
+
+    def seconds_until_close(self) -> float:
+        """How much of the current open window is left; 0 when it is not open.
+
+        Callers that can afford to wait (a whole domain, which has fetched nothing
+        yet) use this to sleep until the provider is plausibly back, rather than
+        guessing at a fixed backoff.
+        """
+        if self.state != "open":
+            return 0.0
+        return max(0.0, self._open_for - (time.monotonic() - self._opened_at))
 
     def check(self) -> None:
         """Raise CircuitOpen if this call must not be made."""
         state = self.state
         if state == "open":
-            raise CircuitOpen(self.provider, self.open_seconds - (time.monotonic() - self._opened_at))
+            raise CircuitOpen(self.provider, self._open_for - (time.monotonic() - self._opened_at))
         if state == "half_open" and len(self._probe_results) >= self.probes:
             # Probes are in flight; hold callers back until they resolve.
             raise CircuitOpen(self.provider, 1.0)
@@ -139,16 +173,24 @@ class CircuitBreaker:
             self._open()
 
     def _open(self) -> None:
+        now = time.monotonic()
+        if self._closed_at and now - self._closed_at > self.open_seconds * self.recovery_multiple:
+            self._consecutive_opens = 0          # it genuinely recovered in between
+        self._open_for = min(
+            self.open_seconds * (2 ** self._consecutive_opens), self.max_open_seconds
+        )
+        self._consecutive_opens += 1
         self.last_open_reasons = dict(self.failure_reasons)
         self.failure_reasons = {}
         self._state = "open"
-        self._opened_at = time.monotonic()
+        self._opened_at = now
         self._outcomes.clear()
         self._probe_results = []
         self.opened_count += 1
 
     def _close(self) -> None:
         self._state = "closed"
+        self._closed_at = time.monotonic()
         self._outcomes.clear()
         self._probe_results = []
 
@@ -195,6 +237,9 @@ class FetchGate:
 
         # An open breaker means "pause", not "fail". Raising here failed every waiting
         # domain instantly -- one 429 burst wrote off thousands of rows in seconds.
+        # The cap stays modest because giving up here is no longer the end of the
+        # domain: process_domain treats CircuitOpen as retryable and comes back once
+        # the breaker's window has run, so a slot never blocks for a whole outage.
         MAX_BREAKER_WAIT_S = 30.0
 
         async def __aenter__(self) -> "FetchGate._Slot":

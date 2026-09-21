@@ -417,3 +417,56 @@ async def test_breaker_records_why_it_opened(monkeypatch):
         if g.breaker.opened_count:
             break
     assert any("503" in k for k in g.breaker.last_open_reasons), g.breaker.last_open_reasons
+
+
+# --- r.jina.ai is a PROXY: a slow target is not an unhealthy provider -----
+
+
+@respx.mock
+async def test_read_timeout_against_jina_is_not_blamed_on_the_provider():
+    """Jina fetches the target for us, so a slow business site makes OUR request slow.
+    Counting those opened the breaker on 3,095 domains of the 16k run, none of them
+    Jina's fault -- the hand-built retry pass then found addresses on 54% of them."""
+    g = gate()
+    respx.get(url__startswith="https://r.jina.ai/").mock(
+        side_effect=httpx.ReadTimeout("target is slow")
+    )
+    fetcher = JinaFetcher(g)
+    for i in range(30):
+        with pytest.raises(FetchError):
+            await fetcher.get_html(f"https://slowsite{i}.com/")
+    assert g.breaker.state == "closed"
+    assert g.breaker.opened_count == 0
+
+
+@respx.mock
+async def test_a_read_timeout_is_still_transient_and_still_retried():
+    """Not blaming the provider must not quietly turn it into a permanent failure."""
+    g = gate()
+    route = respx.get(url__startswith="https://r.jina.ai/")
+    route.side_effect = [httpx.ReadTimeout("slow"), jina_ok()]
+    r = await JinaFetcher(g).get_html("https://acme.com/")
+    assert r.status == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_jina_deadline_expires_before_our_client_deadline():
+    """X-Timeout was connect+read, i.e. 10s, while the client gave up at its 7s read
+    timeout -- so Jina's own classified answer was never read on a slow page."""
+    g = gate()
+    route = respx.get(url__startswith="https://r.jina.ai/").mock(return_value=jina_ok())
+    await JinaFetcher(g).get_html("https://acme.com/")
+    request = route.calls[0].request
+    assert int(request.headers["X-Timeout"]) < request.extensions["timeout"]["read"]
+
+
+@respx.mock
+async def test_direct_site_fetches_keep_the_tight_timeout():
+    """The wider budget is per-request, so it must not leak onto target fetches."""
+    g = gate()
+    route = respx.get("https://acme.com/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *")
+    )
+    await HttpxFetcher(g).get_text("https://acme.com/robots.txt")
+    assert route.calls[0].request.extensions["timeout"]["read"] == F.settings.read_timeout_s

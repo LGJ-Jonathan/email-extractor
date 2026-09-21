@@ -124,6 +124,31 @@ process. With N worker processes the effective rate is N x `JINA_RPM`. Redis-bac
 is a step-8 concern; the interfaces in `app/ratelimit.py` are narrow so the swap is
 mechanical.
 
+## Fetch stability
+
+The first 16,261-domain run finished at 44.0% found, and a hand-built retry pass over
+its transient failures lifted that to 55.4%. Plotting `circuit_open` against found-rate
+in completion order showed why: the breaker oscillated for the whole seven hours.
+Stretches with it quiet found 56-62% of addresses; stretches with it thrashing found
+24-33%. All 3,095 `circuit_open` rows had `n_pages=0` -- no page was ever fetched for
+them, so nothing was wasted except the result.
+
+| Defect | Effect | Fix |
+| --- | --- | --- |
+| `_exc_to_fetch_error` blamed every transport failure on the provider | r.jina.ai is a proxy, so a slow business site makes our request to Jina slow. At `READ_TIMEOUT_S=7` any site over 7s voted "Jina is unhealthy" | only `ConnectError`/`ConnectTimeout`/`PoolTimeout` count against provider health; a `ReadTimeout` after a successful connect is the target |
+| `X-Timeout` was `connect + read` = 10s against a client read timeout of 7s | we always abandoned first, so Jina's own classified answer for a slow page was never read -- and, before the fix above, became a provider failure | `X-Timeout` is `JINA_TIMEOUT_S`; the Jina call gets a per-request client budget 5s wider. Direct target fetches keep the tight one |
+| `probes_needed=4` of 5 | an 80% bar to recover, while the breaker opens at a 30% failure rate -- half-open usually failed and reopened at once. That is the oscillation | `probes_needed=3`, plus open windows that double to `max_open_seconds` and reset only after holding closed |
+| `CircuitOpen` ended the domain | provider backpressure was recorded as the domain's own `fetch_failed`, and `max_domain_attempts` / `retry_pass_delay_s` were dead settings | `process_domain` retries the whole domain up to `MAX_DOMAIN_ATTEMPTS`, sleeping out the breaker's remaining window. Each attempt gets its own deadline |
+
+Still open, in rough order of value: `FetchGate.release_domain` is never called, so
+`_per_domain` grows one semaphore per domain (16,261 last run, 50k at target);
+`TokenBucket.acquire` has no fairness or jitter, so 50 waiters wake together and the
+tail feeds `domain_timeout`; the bucket docstring claims a 50-request burst while the
+code computes 10; the bucket, breaker and semaphores are still per worker process, so
+N workers means N x `JINA_RPM` and a trip in one protects none of the others; and
+nothing persists `last_open_reasons`, so a storm can only be reconstructed afterwards
+from CSV row order.
+
 ## Build progress
 
 Build order is SPEC.md section 13; each step stops and reports before the next starts.

@@ -25,10 +25,21 @@ from app.pipeline.extract.socials import extract_socials
 from app.pipeline.filter_rank import rank_candidates, rules_best
 from app.pipeline.status import StatusInputs, assign_status
 from app.pipeline.typesafe import TypeSafeClient, rules_only
+from app.ratelimit import jittered
 from app.schemas import DomainResult, EmailCandidateOut
 from app.settings import settings
 
 log = logging.getLogger("email_extractor.pipeline")
+
+# Reasons that are the PROVIDER's fault rather than the domain's, so the domain has
+# earned another go. A circuit_open domain has fetched nothing and cost nothing --
+# verified on the 16k run, where all 3,095 of them had n_pages=0 -- so retrying is
+# free except for time. Doing it by hand after that run recovered 1,849 of 3,404.
+# domain_timeout is deliberately NOT here: it means we already spent the budget.
+RETRYABLE_DOMAIN_REASONS = frozenset({"circuit_open"})
+
+MIN_RETRY_DELAY_S = 1.0
+MAX_RETRY_DELAY_S = 60.0
 
 # One client per process: it owns the TypeSafe concurrency limit and its own breaker.
 _judge = TypeSafeClient()
@@ -80,17 +91,59 @@ def _result(domain: str, **kw) -> DomainResult:
     return DomainResult(domain=domain, **kw)
 
 
+def _retry_delay(fetcher: Fetcher) -> float:
+    """Sleep until the breaker's window has plausibly run, not a fixed backoff.
+
+    Asking the breaker how long it has left beats guessing: with escalating open
+    windows a fixed delay either wakes far too early (and is refused again, burning
+    an attempt for nothing) or far too late.
+    """
+    breaker = getattr(getattr(fetcher, "gate", None), "breaker", None)
+    remaining = breaker.seconds_until_close() if breaker is not None else 0.0
+    return jittered(min(max(remaining, MIN_RETRY_DELAY_S), MAX_RETRY_DELAY_S), 0.5)
+
+
 async def process_domain(domain: str, fetcher: Fetcher | None = None) -> DomainResult:
-    """Run the stages for one crawl key. Never raises for a domain-level problem."""
-    started = time.perf_counter()
+    """Run the stages for one crawl key. Never raises for a domain-level problem.
+
+    An open breaker is provider backpressure, so it suspends the domain rather than
+    ending it: the attempt is retried up to `max_domain_attempts` times. Each attempt
+    gets its own deadline, because time spent waiting on the provider is not time the
+    domain spent working.
+    """
     fetcher = fetcher or build_fetcher()
+    attempts = max(1, settings.max_domain_attempts)
+    result = _result(domain, status="fetch_failed", error_reason="no_attempt")
+    for attempt in range(1, attempts + 1):
+        result = await _attempt_domain(domain, fetcher)
+        if result.error_reason not in RETRYABLE_DOMAIN_REASONS or attempt >= attempts:
+            return result
+        delay = _retry_delay(fetcher)
+        log.info(
+            "domain_retry",
+            extra={
+                "domain": domain,
+                "attempt": attempt,
+                "of": attempts,
+                "reason": result.error_reason,
+                "delay_s": round(delay, 1),
+            },
+        )
+        await asyncio.sleep(delay)
+    return result
+
+
+async def _attempt_domain(domain: str, fetcher: Fetcher) -> DomainResult:
+    """One pass over the stages, under one domain deadline."""
+    started = time.perf_counter()
     scratch = Scratch()
     try:
         async with asyncio.timeout(settings.domain_timeout_s):
             return await _process(domain, fetcher, started, scratch)
     except CircuitOpen:
         # Spec 17 level 3: the provider is unhealthy, so this is not the domain's fault.
-        # Transient, and the retry pass picks it up.
+        # process_domain retries it; this reason only reaches a result row once every
+        # attempt has been used, which is the one case where it is really the answer.
         log.warning("circuit_open", extra={"domain": domain})
         return _result(domain, status="fetch_failed", error_reason="circuit_open")
     except TimeoutError:

@@ -188,12 +188,23 @@ def decode_body(raw: bytes, response: httpx.Response) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+# Failures that genuinely say something about the PROVIDER's health. r.jina.ai is a
+# proxy: it fetches the business site for us, so a slow site on cheap shared hosting
+# makes OUR request to Jina slow. Only a failure that happened before Jina accepted the
+# request -- connect, TLS handshake, exhausted connection pool -- is evidence about
+# Jina. A ReadTimeout after a successful connect is the target rendering slowly, and
+# counting those as provider failures is what opened the breaker on 3,095 domains in
+# the 16k run; none of them were Jina's fault and the retry pass found 54% of them.
+PROVIDER_HEALTH_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
 def _exc_to_fetch_error(exc: Exception, *, provider: bool = False) -> FetchError:
     """`provider` says whether this transport failure was talking to the PROVIDER.
 
     It was previously accepted and ignored, so every timeout against r.jina.ai recorded
     as a breaker success while target-side 409/422 recorded as failures -- exactly
-    backwards.
+    backwards. Now it is honoured, but only for the exception types above: "we were
+    talking to Jina" is necessary for blaming Jina, not sufficient.
     """
     if isinstance(exc, httpx.TooManyRedirects):
         return FetchError(ErrorClass.PERMANENT, "redirect_loop", type(exc).__name__)
@@ -201,7 +212,10 @@ def _exc_to_fetch_error(exc: Exception, *, provider: bool = False) -> FetchError
         return FetchError(ErrorClass.PERMANENT, "ssl_error", str(exc)[:120])
     if isinstance(exc, (httpx.TimeoutException, httpx.HTTPError)):
         return FetchError(
-            ErrorClass.TRANSIENT, "homepage", type(exc).__name__, provider=provider
+            ErrorClass.TRANSIENT,
+            "homepage",
+            type(exc).__name__,
+            provider=provider and isinstance(exc, PROVIDER_HEALTH_EXC),
         )
     return FetchError(ErrorClass.BUG, "internal_error", f"{type(exc).__name__}: {exc}"[:200])
 
@@ -350,9 +364,27 @@ class JinaFetcher(_BaseFetcher):
 
     provider_backed = True
 
+    # Our client deadline must sit OUTSIDE Jina's own (X-Timeout), not inside it. It
+    # was connect+read = 10s against an X-Timeout of 10s, so the client abandoned the
+    # request at the read timeout of 7s and Jina's own answer -- which says whether the
+    # target was slow, blocked or non-HTML -- was never read. Every slow page became
+    # our ReadTimeout instead of its classified error. This margin covers Jina's
+    # response overhead once it has stopped waiting on the target.
+    CLIENT_MARGIN_S = 5.0
+
     def __init__(self, gate: FetchGate) -> None:
         super().__init__(gate)
         self._text = HttpxFetcher(gate)
+
+    def _timeout(self) -> httpx.Timeout:
+        """Per-request, so direct target fetches keep the tight shared-client budget."""
+        outer = settings.jina_timeout_s + self.CLIENT_MARGIN_S
+        return httpx.Timeout(
+            connect=settings.connect_timeout_s,
+            read=outer,
+            write=outer,
+            pool=settings.connect_timeout_s,
+        )
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -361,8 +393,10 @@ class JinaFetcher(_BaseFetcher):
             "X-Engine": "direct",
             "X-Respond-With": "html",
             "X-Retain-Images": "none",
-            # X-Timeout is Jina's own deadline; keep it inside our client timeout.
-            "X-Timeout": str(settings.connect_timeout_s + settings.read_timeout_s),
+            # X-Timeout is Jina's own deadline and must expire FIRST, so that a slow
+            # target comes back as Jina's classified error rather than our timeout.
+            # settings.read_timeout_s belongs to direct site fetches, not to this one.
+            "X-Timeout": str(settings.jina_timeout_s),
             # DEVIATION 2: the spec's script:not(...) clause strips JSON-LD too.
             "X-Remove-Selector": (
                 "style, svg, img, iframe, noscript, link, meta, "
@@ -391,7 +425,7 @@ class JinaFetcher(_BaseFetcher):
 
         async def go() -> FetchResult:
             client = get_client()
-            r = await client.get(JINA_BASE + url, headers=self._headers())
+            r = await client.get(JINA_BASE + url, headers=self._headers(), timeout=self._timeout())
             cls = classify_provider_status(r.status_code)
             if cls is not None:
                 if cls is ErrorClass.TRANSIENT and r.status_code == 429:

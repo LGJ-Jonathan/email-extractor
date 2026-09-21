@@ -8,6 +8,8 @@ from app.pipeline.fetch import ErrorClass, FetchError, FetchResult
 from app.pipeline.parked import check_final_url, check_ns, check_text, is_parked, visible_text
 from app.pipeline.run import fetch_homepage, process_domain
 from app.pipeline.status import StatusInputs, assign_status
+from app.ratelimit import CircuitOpen
+from app.settings import settings as st
 
 
 # --- MX classification ----------------------------------------------------
@@ -340,3 +342,62 @@ async def test_timeout_with_nothing_fetched_is_still_a_clean_failure(fake_dns, m
     r = await process_domain("acme.com", NeverReturns())
     assert (r.status, r.error_reason) == ("fetch_failed", "domain_timeout")
     assert r.mx_provider == "google"               # DNS work still reported
+
+
+# --- an open breaker suspends a domain, it does not end it ----------------
+
+
+class CircuitThenOk:
+    """Refuses the first `trips` fetches the way an open breaker does, then serves."""
+
+    def __init__(self, trips: int):
+        self.trips = trips
+        self.calls: list[str] = []
+
+    async def get_html(self, url: str, *, domain: str | None = None) -> FetchResult:
+        self.calls.append(url)
+        if self.trips > 0:
+            self.trips -= 1
+            raise CircuitOpen("jina", 0.0)
+        return ok(url)
+
+    async def get_text(self, url: str, *, domain: str | None = None) -> FetchResult:
+        raise NotImplementedError
+
+
+@pytest.fixture
+def _instant_retries(monkeypatch):
+    monkeypatch.setattr(run_mod, "MIN_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(run_mod, "MAX_RETRY_DELAY_S", 0.002)
+    monkeypatch.setattr(st, "max_domain_attempts", 3)
+
+
+async def test_circuit_open_retries_the_domain_instead_of_writing_it_off(
+    fake_dns, _instant_retries
+):
+    """The 16k run wrote off 3,095 domains this way, every one of them with n_pages=0.
+    A hand-built retry pass then found addresses on 54% of them."""
+    fake_dns()
+    f = CircuitThenOk(trips=1)
+    r = await process_domain("acme.com", f)
+    assert r.error_reason != "circuit_open"
+    assert r.pages_fetched, "the second attempt should have fetched the homepage"
+    assert len(f.calls) >= 2
+
+
+async def test_circuit_open_gives_up_after_max_domain_attempts(fake_dns, _instant_retries):
+    """settings.max_domain_attempts was dead code; retrying forever is not the fix."""
+    fake_dns()
+    f = CircuitThenOk(trips=99)
+    r = await process_domain("acme.com", f)
+    assert (r.status, r.error_reason) == ("fetch_failed", "circuit_open")
+    assert len(f.calls) == 3                      # one homepage attempt per try, no more
+
+
+async def test_a_domains_own_failure_is_not_retried(fake_dns, _instant_retries):
+    """Only provider faults earn another go: re-running a dead site just costs time."""
+    fake_dns(resolves=False, mx_provider="none")
+    f = CircuitThenOk(trips=0)
+    r = await process_domain("acme.com", f)
+    assert (r.status, r.error_reason) == ("fetch_failed", "dns")
+    assert f.calls == []
