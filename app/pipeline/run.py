@@ -65,6 +65,9 @@ class Scratch:
     home_html: str = ""
     pages: list[tuple[str, int, str]] = field(default_factory=list)
     tokens: int = 0
+    # Stages 5-6 over `pages`, keyed by how many pages there were: judging and
+    # harvesting both need it, and it is the domain's biggest slice of CPU.
+    extracted: tuple[int, tuple] | None = None
 
 # Spec stage 2. A fourth rung, http://www.{d}/, would also cover www-only legacy sites
 # that serve no TLS; it is deliberately not added because the spec lists three.
@@ -75,12 +78,24 @@ HOMEPAGE_LADDER = (
 )
 
 
+def ladder_for(dns: DnsResult | None) -> tuple[tuple[str, bool], ...]:
+    """The rungs worth trying. Stage 1 already looked up both the bare host and www;
+    a rung whose host has no address record costs a provider call and up to 15 s (plus
+    retries) to learn what DNS already said."""
+    if dns is None or not dns.resolves:
+        return HOMEPAGE_LADDER
+    return tuple(
+        (scheme, www) for scheme, www in HOMEPAGE_LADDER
+        if (dns.a_www if www else dns.a_domain)
+    ) or HOMEPAGE_LADDER
+
+
 async def fetch_homepage(
-    fetcher: Fetcher, domain: str
+    fetcher: Fetcher, domain: str, dns: DnsResult | None = None
 ) -> tuple[FetchResult | None, FetchError | None]:
     """Try each rung in order; the first success wins (spec 16: never fetch both)."""
     last: FetchError | None = None
-    for scheme, www in HOMEPAGE_LADDER:
+    for scheme, www in ladder_for(dns):
         url = crawl_url(domain, scheme=scheme, www=www)
         try:
             return await fetcher.get_html(url, domain=domain), None
@@ -219,7 +234,7 @@ async def _process(
     # --- stage 2 + wave 1 (spec 16): homepage, robots.txt and /sitemap.xml together
     host = host_of_key(domain)
     home_r, robots_text, sitemap_text = await asyncio.gather(
-        fetch_homepage(fetcher, domain),
+        fetch_homepage(fetcher, domain, dns),
         fetch_text_or_blank(fetcher, f"https://{host}/robots.txt", domain),
         fetch_text_or_blank(fetcher, f"https://{host}/sitemap.xml", domain),
     )
@@ -262,7 +277,7 @@ async def _process(
     )
     log.info(
         "discovered",
-        extra={"domain": domain, "selected": [c.url for c in selected], **diag},
+        extra={"domain": domain, "selected": [c.target for c in selected], **diag},
     )
 
     # --- stages 4-6: fetch the selected pages in the spec 16 wave order, extracting
@@ -273,10 +288,10 @@ async def _process(
 
     async def fetch_page(c) -> tuple[str, int, str, int]:
         try:
-            r = await fetcher.get_html(c.url, domain=domain)
+            r = await fetcher.get_html(c.target, domain=domain)
             return r.final_url, c.score, r.html, (r.jina_tokens or 0)
         except FetchError:
-            return c.url, c.score, "", 0
+            return c.target, c.score, "", 0
 
     contact = next((c for c in selected if c.tier == "contact"), None)
     rest = [c for c in selected if c is not contact]
@@ -308,7 +323,15 @@ async def _process(
 
 
 def _extract_all(scratch: Scratch):
-    """Run stages 5-6 over whatever pages the scratchpad holds."""
+    """Run stages 5-6 over whatever pages the scratchpad holds (once per page set)."""
+    if scratch.extracted is not None and scratch.extracted[0] == len(scratch.pages):
+        return scratch.extracted[1]
+    out = _extract_pages(scratch)
+    scratch.extracted = (len(scratch.pages), out)
+    return out
+
+
+def _extract_pages(scratch: Scratch):
     per_page: list[list[EmailCandidate]] = []
     phones: list[str] = []
     socials: dict[str, str] = {}

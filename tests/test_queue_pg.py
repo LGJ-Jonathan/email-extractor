@@ -1229,3 +1229,85 @@ async def test_worker_retries_with_a_newly_saved_key_instead_of_pausing(db, monk
     async with db() as s:
         assert await s.scalar(text("SELECT count(*) FROM jobs WHERE status = 'paused'")) == 0
     provider_keys.reset_for_tests()
+
+
+# --- fourth review: races the queue lost ---------------------------------------
+
+
+async def test_two_claims_finishing_a_jobs_last_domains_together_complete_it(db):
+    """Both finishers used to see the other's row as still running and neither marked
+    the job done, so it stayed 'running' forever."""
+    from app import queue
+    from app.schemas import DomainResult
+
+    job = await make_job(db, ["a.com", "b.com"])
+    async with db() as s:
+        c1 = await queue.claim(s, "w")
+        c2 = await queue.claim(s, "w")
+    assert {c1.domain, c2.domain} == {"a.com", "b.com"}
+
+    async def finish(c):
+        async with db() as s:
+            return await queue.finish(s, c, DomainResult(domain=c.domain, status="no_contact_info"),
+                                      from_cache=False)
+
+    # Each finish opens its own session and transaction; run them at once, many times.
+    results = await asyncio.gather(finish(c1), finish(c2))
+    assert sum(1 for recorded, done in results if done) == 1
+    async with db() as s:
+        assert await job_status(s, job.id) == "done"
+
+
+async def test_a_lost_claim_releases_its_domain_lock(db):
+    """The handler whose row was reaped kept the domain lock, and the per-worker
+    heartbeat renewed it forever: every job holding that domain stalled."""
+    from app import queue
+    from app.schemas import DomainResult
+
+    await make_job(db, ["stuck.com"])
+    async with db() as s:
+        old = await queue.claim(s, "w")
+        assert await queue.lock_domain(s, old)
+        await s.execute(text("UPDATE job_domains SET heartbeat_at = now() - interval '1 hour'"))
+        await s.commit()
+        await queue.reap(s)
+        new = await queue.claim(s, "w")
+        r = DomainResult(domain="stuck.com", status="found", best_email="a@stuck.com")
+        assert await queue.finish(s, old, r, from_cache=False) == (False, False)
+        assert await s.scalar(text("SELECT lock_owner FROM domains")) is None
+        assert await queue.lock_domain(s, new)
+
+
+async def test_heartbeat_renews_only_live_claims(db):
+    from app import queue
+
+    await make_job(db, ["live.com"])
+    await make_job(db, ["dead.com"])
+    async with db() as s:
+        live = await queue.claim(s, "w")
+        dead = await queue.claim(s, "w")
+        assert await queue.lock_domain(s, live) and await queue.lock_domain(s, dead)
+        await s.execute(text("UPDATE job_domains SET heartbeat_at = now() - interval '1 hour'"))
+        await s.execute(text("UPDATE domains SET lock_until = now() - interval '1 hour'"))
+        await s.commit()
+        await queue.heartbeat(s, [live.token])
+        assert await queue.reap(s) == 1
+        state = dict((await s.execute(text(
+            "SELECT domain, state FROM job_domains"))).all())
+        assert state == {"live.com": "running", "dead.com": "queued"}
+        expired = await s.scalar(text(
+            "SELECT count(*) FROM domains WHERE lock_until < now()"))
+        assert expired == 1
+
+
+async def test_the_sweep_completes_a_job_that_slipped_through(db):
+    from app import queue
+
+    job = await make_job(db, ["x.com"])
+    async with db() as s:
+        await s.execute(text("UPDATE job_domains SET state = 'done'"))
+        await s.execute(text("UPDATE jobs SET status = 'running'"))
+        await s.commit()
+        assert await queue.complete_finished_jobs(s) == 1
+        assert await queue.complete_finished_jobs(s) == 0
+        assert await job_status(s, job.id) == "done"

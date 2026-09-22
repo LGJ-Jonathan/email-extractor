@@ -4,11 +4,9 @@ import json
 import re
 
 from app.pipeline.extract.patterns import EMAIL, clean
+from app.pipeline.htmlscan import iter_blocks
 
-JSONLD_BLOCK = re.compile(
-    r"<script[^>]*type\s*=\s*[\"']?application/ld\+json[^>]*>(.*?)</script\s*>",
-    re.I | re.S,
-)
+_JSONLD_TYPE = re.compile(r"type\s*=\s*[\"']?application/ld\+json", re.I)
 _TRAILING_COMMA = re.compile(r",\s*([}\]])")
 
 
@@ -28,7 +26,9 @@ def _walk(node: object, out: list[str]) -> None:
 
 
 def blocks(html: str) -> list[str]:
-    return [b for b in JSONLD_BLOCK.findall(html or "")]
+    html = html or ""
+    return [html[b.body_start:b.body_end] for b in iter_blocks(html, "script")
+            if _JSONLD_TYPE.search(b.attrs)]
 
 
 def emails_from_block(body: str) -> tuple[list[str], bool]:

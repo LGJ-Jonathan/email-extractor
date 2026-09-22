@@ -233,6 +233,71 @@ but means a second worker process gets its own breaker; and nothing persists
 `last_open_reasons`, so a storm can only be reconstructed afterwards from logs.
 `release_domain` is now called by the worker once a domain finishes.
 
+## Fourth review pass
+
+A full read of the queue, the pipeline and the API before the soak test. Each fix has a
+test naming the case (`tests/test_fourth_review.py`, and the last four tests of
+`tests/test_queue_pg.py`).
+
+Queue:
+
+| Defect | Effect | Fix |
+| --- | --- | --- |
+| Two claims finishing a job's last two domains at once each saw the other's row as still running (READ COMMITTED) | neither marked the job done: no `job.done` webhook, and one of the owner's three active-job slots gone for good | `complete_if_finished` locks the job row first, in its own statement, so the second finisher runs after the first commits; the reap loop also sweeps for finished jobs |
+| A handler whose row was reaped kept its domain lock, and the per-worker heartbeat renewed every lock with the worker's prefix | every job holding that domain requeued at no attempt cost, forever, until the worker restarted | the lost-claim path releases the lock; the heartbeat renews only the claims the worker is still running, so an orphaned row or lock expires and is reaped |
+| No index on `jobs.status` | the claim query and every idle poll scanned the whole (never pruned) jobs table | partial index `ix_jobs_active` (migration 0010) |
+
+Pipeline:
+
+| Defect | Effect | Fix |
+| --- | --- | --- |
+| `<script…>(.*?)</script>` regexes were quadratic on unclosed tags | 160 KB of bare `<script>` took 15 s per pass, synchronously, with every other domain stalled and the domain timeout unable to interrupt | one forward scan (`app/pipeline/htmlscan.py`) used by the fetcher, JSON-LD, normalisation and the script source |
+| Direct fetches (robots, sitemaps, `FETCH_BACKEND=httpx`) had no address check and followed redirects blindly | a site resolving to `10/8` or Railway's `fd12::` range, or 302ing there, was fetched from inside the private network and its body mined | every hop is resolved and refused unless public (`app/netguard.py`, shared with webhooks; also now refuses NAT64 and 6to4 forms). `FETCH_GUARD_PRIVATE_ADDRESSES=false` only for tests |
+| Rule 6's cue had no word boundary, so "mail" matched inside "Gmail" | "Sign up with Gmail. Find us at acmeroofing dot com" emitted `us@acmeroofing.com` at rank 1 | whole-word cue |
+| A sentence glued after a real TLD (`info@acme.com.Call us`) passed the suffix check because `.call` is a TLD; a one-letter tail was trimmed as glue | `info@acme.com.call`; `info@acme.usa` became `info@acme.us` | a capitalised word after a common TLD is trimmed before cleaning; a glued tail must be at least two letters |
+| Discovered URLs were fetched in canonical form (https, no www, lowercase, no query) | http-only and www-only sites lost every subpage; `/Contact-Us.aspx` 404ed on case-sensitive servers; `?option=com_contact` collapsed into the homepage | canonical form is the dedupe key only; the published URL is fetched |
+| "captcha" anywhere in the first 4 KB of raw HTML meant "blocked" | every homepage loading reCAPTCHA for its contact form failed the whole domain | text markers are matched against what the page shows; `cf-chl` still against the markup |
+| Every inline script was deleted before extraction | `var email = "info@acme.com"` was never seen; the "script" source only saw failed JSON-LD | scripts that carry an address are kept; `visible_text` still removes them |
+| A free-mail provider could be a "sibling brand" | `jane@outlook.com` on outlookdental.com ranked above `info@outlookdental.com` | never |
+| `enquiry@` / `inquiry@` were not role addresses | ranked 1 beside named people on the rules-only path | added, with `mail@` and `reception@` |
+| Parking nameserver markers were substrings | `ns1.jordan.com` contained "dan.com": parked without a fetch | whole labels |
+| Half-open breaker counted probes when they finished, not when admitted | 50 of 50 waiters went through at once when the window ended | admission counted |
+
+API:
+
+| Defect | Effect | Fix |
+| --- | --- | --- |
+| `File(...)` parameters are parsed before any dependency runs | unauthenticated callers could have the API buffer 50 MB uploads, as many as they liked, before the 401 | the form is read inside the handler after the key check; a declared `Content-Length` over the cap is refused before a byte is read |
+| Every row was expanded to the header's width | a 20 KB .xlsx with one value in column XFD grew to 1.1 GB | 500-column cap (`too_many_columns`), trailing blank columns ignored, .xlsx width taken from the header row |
+| Parsing ran on the event loop | one 25 s parse stalled `/healthz` and every poll | parsing and column detection run in a worker thread |
+| The upload's name went raw into `Content-Disposition` | a Cyrillic or CJK name made every CSV download a 500; a quote broke the header | ASCII fallback plus `filename*=UTF-8''` |
+| Header names were not formula-guarded; a cell over the csv module's field limit was a 500 | `=HYPERLINK(...)` in a source header executed in Excel; `internal_error` instead of `invalid_file` | both handled |
+
+## Throughput
+
+Throughput is `JINA_RPM` divided by Jina calls per domain, provided enough domains are
+in flight to keep the bucket busy. The 16k run measured ~45 domains/min at 500 rpm,
+which is ~11 Jina calls per domain: a page budget of 5 plus ladder rungs, retries, and
+-- until this pass -- robots.txt and `/sitemap.xml`, which are direct httpx fetches but
+were passed through the Jina gate and so spent two Jina tokens per domain and were
+refused whenever Jina's breaker was open. This pass:
+
+- gives direct fetches their own gate (concurrency only, no rate limit, no breaker);
+- skips homepage ladder rungs that stage 1's DNS already ruled out (`www` with no
+  record, or the bare host with none), each of which cost a Jina call and up to 15 s
+  plus retries;
+- runs stages 5-6 once per domain instead of twice (judge and harvest each ran the
+  full extraction);
+- removes the quadratic regexes, which were the worker's one unbounded CPU cost.
+
+Levers left, in order of size: `JINA_RPM` is the plan's limit and the ceiling on
+everything; `MAX_PAGES_PER_DOMAIN` (5) and `EARLY_STOP_ON_FIRST_GOOD` trade addresses
+for speed, and the README's own note on the early stop still applies;
+`GLOBAL_FETCH_CONCURRENCY` (50) must stay above `JINA_RPM x average domain seconds /
+60` or the bucket idles -- at 500 rpm and ~40 s per domain that is ~330 in flight to
+saturate it, so 50 leaves the bucket mostly idle and concurrency, not the rate, is what
+paces the run today. Raise it (and `DB_POOL_SIZE`) before raising the rate.
+
 ## Build progress
 
 Build order is SPEC.md section 13; each step stops and reports before the next starts.
@@ -248,4 +313,5 @@ Section 15 edge cases are implemented inside the step that owns their stage.
 - [x] 7. Stage 7: TypeSafe
 - [x] 8. Jobs API, Postgres queue (replaces arq), per-user keys, cache, CSV/JSON, webhook, upload page (§14)
 - [x] Portal integration: service key + acting user, error contract, estimates, provider keys; on Railway
+- [x] Fourth review pass: queue races, quadratic regexes, private-address guard, upload limits
 - [ ] 9. 5k soak test through the running service, then 50k (needs Jina credit)

@@ -14,16 +14,15 @@ Three things this module guards against, all found in review:
 import asyncio
 import hashlib
 import hmac
-import ipaddress
 import json
 import logging
-import socket
 import time
 import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from app import netguard
 from app.settings import settings
 
 log = logging.getLogger("email_extractor")
@@ -33,12 +32,6 @@ BACKOFF_S = (2.0, 8.0, 30.0)
 
 class WebhookRejected(ValueError):
     pass
-
-
-def _public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return ip.is_global and not ip.is_multicast
 
 
 async def resolve_public(url: str) -> tuple[str, str, int]:
@@ -59,23 +52,12 @@ async def resolve_public(url: str) -> tuple[str, str, int]:
         raise WebhookRejected("webhook_url has an invalid port") from e
 
     try:
-        literal = ipaddress.ip_address(host)
-        addrs = [literal]
-    except ValueError:
-        try:
-            infos = await asyncio.get_running_loop().getaddrinfo(
-                host, port, type=socket.SOCK_STREAM
-            )
-        except OSError as e:
-            raise WebhookRejected("webhook_url host does not resolve") from e
-        addrs = [ipaddress.ip_address(info[4][0]) for info in infos]
-    if not addrs:
-        raise WebhookRejected("webhook_url host does not resolve")
-    # Every address, not just the first: a name with one public and one private A
-    # record would otherwise pass the check and be delivered to the private one.
-    if not all(_public(a) for a in addrs):
-        raise WebhookRejected("webhook_url must point at a public address")
-    return host, str(addrs[0]), port
+        addrs = await netguard.resolve_public(host, port)
+    except netguard.PrivateAddress as e:
+        raise WebhookRejected("webhook_url must point at a public address") from e
+    except OSError as e:
+        raise WebhookRejected("webhook_url host does not resolve") from e
+    return host, addrs[0], port
 
 
 async def validate_webhook_url(url: str | None) -> None:

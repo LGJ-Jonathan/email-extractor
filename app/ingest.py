@@ -15,6 +15,7 @@ from app.pipeline.normalize import FREE_EMAIL_LABELS, NormalizedInput, normalize
 
 log = logging.getLogger("email_extractor.ingest")
 
+MAX_COLUMNS = 500
 MAX_ROWS = 50_000
 MAX_BYTES = 50 * 1024 * 1024
 SNIFF_BYTES = 20_000
@@ -130,11 +131,16 @@ def parse_bytes(raw: bytes, filename: str = "") -> ParsedFile:
     delimiter = sniff_delimiter(text, filename)
     # The csv module handles quoted fields with embedded newlines and delimiters.
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
-    records = list(reader)
+    try:
+        records = list(reader)
+    except csv.Error as e:          # one cell over the csv module's 128 KB field limit
+        raise IngestError("the file has a cell too large to be a spreadsheet cell",
+                          "invalid_file") from e
     if not records:
         raise IngestError("file is empty", "empty_file")
 
-    first = [c.strip() for c in records[0]]
+    first = _trim_trailing_blanks([c.strip() for c in records[0]])
+    _check_width(len(first))
     had_header = looks_like_header(first)
     if had_header:
         headers = [h.strip() or f"column_{i + 1}" for i, h in enumerate(first)]
@@ -147,6 +153,20 @@ def parse_bytes(raw: bytes, filename: str = "") -> ParsedFile:
     if len(body) > MAX_ROWS:
         raise IngestError(f"{len(body):,} data rows, limit is {MAX_ROWS:,}", "too_many_rows")
     return ParsedFile(headers, rows, had_header, delimiter, encoding)
+
+
+def _trim_trailing_blanks(cells: list[str]) -> list[str]:
+    while cells and not cells[-1]:
+        cells.pop()
+    return cells
+
+
+def _check_width(n: int) -> None:
+    # Every row is expanded to the header's width, so a 20 KB file with 2,000 header
+    # cells (or an .xlsx with one value in column XFD, width 16,384) grew to hundreds
+    # of megabytes in memory. No lead list has this many columns.
+    if n > MAX_COLUMNS:
+        raise IngestError(f"{n:,} columns, limit is {MAX_COLUMNS:,}", "too_many_columns")
 
 
 def _to_row(headers: list[str], record: list[str]) -> dict[str, str]:
@@ -168,10 +188,17 @@ def _parse_xlsx(raw: bytes) -> ParsedFile:
         raise IngestError("the spreadsheet could not be opened; re-save it as .xlsx or .csv",
                           "invalid_file") from e
     ws = wb[wb.sheetnames[0]]
-    # Stop one past the cap: a small .xlsx can expand to millions of rows.
+    # Stop one past the cap: a small .xlsx can expand to millions of rows. Width is
+    # taken from the header row's last non-empty cell, not the sheet's dimensions.
     records = []
-    for row in ws.iter_rows(values_only=True):
-        records.append(["" if c is None else str(c).strip() for c in row])
+    width: int | None = None
+    for row in ws.iter_rows(values_only=True, max_col=MAX_COLUMNS + 1):
+        cells = ["" if c is None else str(c).strip() for c in row]
+        if width is None:
+            cells = _trim_trailing_blanks(cells)
+            _check_width(len(cells))
+            width = len(cells)
+        records.append(cells[:width])
         if len(records) > MAX_ROWS + 1:
             break
     wb.close()

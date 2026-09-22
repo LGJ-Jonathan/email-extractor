@@ -17,6 +17,12 @@ Four corrections to the literal spec text, each with a test naming the case it f
    the four slots, the sort has `url` as a final tiebreak, and the per-tier cap is 2 --
    "at most one per tier" made a second contact page unreachable while forcing a legal
    page into the crawl.
+
+The canonical form is the dedupe KEY only. The page is fetched at the URL the site
+actually published (`fetch_url`): the canonical form forced https and dropped `www.`,
+the path's case and the query, so on an http-only or www-only site every subpage 404ed
+or redirected to nothing, `/Contact-Us.aspx` on a case-sensitive server was lost, and
+`/index.php?option=com_contact` collapsed into the homepage.
 """
 
 import re
@@ -77,11 +83,16 @@ _WS = re.compile(r"\s+")
 
 @dataclass(frozen=True)
 class ScoredUrl:
-    url: str            # canonical form, used for dedupe and fetching
+    url: str            # canonical form: the dedupe key
     score: int
     tier: str | None
     depth: int
     anchor: str = ""
+    fetch_url: str = "" # the URL as published, which is what gets fetched
+
+    @property
+    def target(self) -> str:
+        return self.fetch_url or self.url
 
 
 def canonical(url: str) -> str:
@@ -169,6 +180,7 @@ def score_url(url: str, anchor: str = "") -> ScoredUrl | None:
         tier=tier,
         depth=len(segments(urlsplit(canon).path)),
         anchor=anchor or "",
+        fetch_url=urlunsplit(parts._replace(fragment="")),
     )
 
 

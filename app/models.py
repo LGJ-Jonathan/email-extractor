@@ -103,6 +103,8 @@ class Job(Base):
 
     __table_args__ = (
         Index("ix_jobs_owner_id_created_at", "owner_id", "created_at"),
+        Index("ix_jobs_active", "status", "created_at",
+              postgresql_where=text("status IN ('queued', 'running', 'paused')")),
         Index("ux_jobs_owner_idempotency", text("coalesce(owner_id::text, 'admin')"),
               "idempotency_key", unique=True,
               postgresql_where=text("idempotency_key IS NOT NULL")),

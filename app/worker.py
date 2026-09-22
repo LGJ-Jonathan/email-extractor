@@ -41,6 +41,7 @@ class Worker:
         self.sessions = get_sessionmaker()
         self.webhooks = WebhookSender()
         self._tasks: set[asyncio.Task] = set()
+        self._live: set[str] = set()       # claim tokens with a handler still running
         self._stopping = asyncio.Event()
 
     def stop(self) -> None:
@@ -89,9 +90,11 @@ class Worker:
                     continue
 
                 async def run_one(c=c):
+                    self._live.add(c.token)
                     try:
                         await self.handle(c)
                     finally:
+                        self._live.discard(c.token)
                         slots.release()
 
                 self._spawn(run_one())
@@ -133,7 +136,7 @@ class Worker:
             await asyncio.sleep(queue.HEARTBEAT_S)
             try:
                 async with self.sessions() as s:
-                    await queue.heartbeat(s, self.id)
+                    await queue.heartbeat(s, list(self._live))
             except Exception:  # noqa: BLE001
                 log.exception("heartbeat_failed")
             try:
@@ -150,6 +153,10 @@ class Worker:
                     n = await queue.reap(s)
                 if n:
                     log.warning("reaped", extra={"rows": n})
+                async with self.sessions() as s:
+                    n = await queue.complete_finished_jobs(s)
+                if n:
+                    log.warning("jobs_completed_by_sweep", extra={"jobs": n})
             except Exception:  # noqa: BLE001
                 log.exception("reap_failed")
             await asyncio.sleep(REAP_EVERY_S)

@@ -221,7 +221,11 @@ async def finish(session: AsyncSession, c: Claim, result: DomainResult,
          "has_linkedin": bool(result.socials.get("linkedin"))},
     )).first()
     if owned is None:
+        # Reaped while we worked. Nothing about the row is ours to write, but the
+        # domain lock still is: leaving it made every job holding this domain requeue
+        # at no attempt cost, forever, because the heartbeat kept renewing it.
         await session.rollback()
+        await unlock_domain(session, c)
         return False, False
     if not from_cache and write_cache:
         await session.execute(
@@ -248,6 +252,16 @@ async def finish(session: AsyncSession, c: Claim, result: DomainResult,
 
 async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
                                *, commit: bool = True) -> bool:
+    """Mark the job done once no row is queued or running.
+
+    The lock on the job row comes first, as its own statement. Under READ COMMITTED
+    the two claims finishing a job's last two domains each saw the other's row as
+    still running (neither had committed), so both declined and the job stayed
+    "running" forever: no job.done webhook, and one of the owner's active-job slots
+    gone for good. Waiting on the row lock makes the second finisher's UPDATE start
+    after the first has committed, and a new statement takes a new snapshot.
+    """
+    await session.execute(text("SELECT id FROM jobs WHERE id = :j FOR UPDATE"), {"j": job_id})
     row = (await session.execute(
         text("""
             UPDATE jobs
@@ -279,22 +293,48 @@ async def pause_active_jobs(session: AsyncSession, reason: str) -> None:
     await session.commit()
 
 
-async def heartbeat(session: AsyncSession, worker: str) -> None:
-    """Keep this worker's claimed rows and domain locks alive."""
-    prefix = worker + "|%"
+async def heartbeat(session: AsyncSession, tokens: list[str]) -> None:
+    """Keep the rows and domain locks of these live claims alive.
+
+    Per claim, not per worker: renewing everything with the worker's prefix kept
+    alive the rows and locks of handlers that had already died (an error path whose
+    requeue failed during a database blip), so the reaper never got them back.
+    """
+    if not tokens:
+        return
     await session.execute(
         text("UPDATE job_domains SET heartbeat_at = now() "
-             "WHERE state = 'running' AND claimed_by LIKE :p"),
-        {"p": prefix},
+             "WHERE state = 'running' AND claimed_by = ANY(:t)"),
+        {"t": list(tokens)},
     )
     await session.execute(
         text("""
             UPDATE domains SET lock_until = now() + make_interval(secs => :lease)
-            WHERE lock_owner IS NOT NULL AND lock_owner LIKE :p
+            WHERE lock_owner IS NOT NULL AND lock_owner = ANY(:t)
         """),
-        {"p": prefix, "lease": LEASE_S},
+        {"t": list(tokens), "lease": LEASE_S},
     )
     await session.commit()
+
+
+async def complete_finished_jobs(session: AsyncSession) -> int:
+    """Belt and braces for complete_if_finished: any queued/running job with nothing
+    left to do is done. Run by the worker's reap loop."""
+    rows = (await session.execute(
+        text("""
+            UPDATE jobs j
+            SET status = 'done', finished_at = now(),
+                done_count = (SELECT count(*) FROM job_domains WHERE job_id = j.id)
+            WHERE j.status IN ('queued', 'running')
+              AND NOT EXISTS (
+                  SELECT 1 FROM job_domains
+                  WHERE job_id = j.id AND state IN ('queued', 'running')
+              )
+            RETURNING j.id
+        """),
+    )).all()
+    await session.commit()
+    return len(rows)
 
 
 async def reap(session: AsyncSession) -> int:

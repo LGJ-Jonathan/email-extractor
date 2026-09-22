@@ -24,6 +24,16 @@ def _pinned_api_key(monkeypatch):
     settings_module.get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_address_guard(monkeypatch):
+    """Fetch tests mock hosts like acme.com at the transport; resolving them is not
+    the point and would make the suite depend on the network. test_fetch turns the
+    guard back on for the tests that are about it."""
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "fetch_guard_private_addresses", False)
+
+
 @pytest.fixture
 def api_key() -> str:
     return TEST_API_KEY

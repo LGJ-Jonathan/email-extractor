@@ -65,10 +65,18 @@ class ParkedVerdict:
         return self.parked
 
 
+def _ns_marker_hit(ns: str, marker: str) -> bool:
+    """Whole labels only: `ns1.jordan.com` contains "dan.com" and `bodisoft.net`
+    contains "bodis", and each was declared parked without a single fetch."""
+    if "." in marker:
+        return ns == marker or ns.endswith("." + marker)
+    return marker in ns.split(".")
+
+
 def check_ns(ns_hosts: list[str]) -> ParkedVerdict:
     for ns in ns_hosts:
-        low = ns.lower()
-        if any(m in low for m in PARKING_NS_MARKERS):
+        low = ns.lower().rstrip(".")
+        if any(_ns_marker_hit(low, m) for m in PARKING_NS_MARKERS):
             return ParkedVerdict(True, "ns")
     return ParkedVerdict()
 

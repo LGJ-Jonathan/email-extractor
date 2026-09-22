@@ -53,7 +53,7 @@ BAD_LOCAL = re.compile(
 
 ROLE_LOCALS = frozenset({
     "info", "hello", "contact", "sales", "support", "office", "admin", "team", "service",
-    "help", "inquiries", "enquiries", "booking", "bookings", "appointments", "estimates",
+    "help", "inquiries", "enquiries", "inquiry", "enquiry", "mail", "reception", "booking", "bookings", "appointments", "estimates",
     "quotes", "marketing", "hr", "careers", "jobs", "billing", "accounts", "privacy",
     "legal", "media", "press", "webmaster",
 })
@@ -123,6 +123,10 @@ def is_own(email_domain: str, site_domain: str) -> bool:
     if host == site or host.endswith("." + site):
         return True
     a, b = _second_level(host), _second_level(site)
+    # A free-mail provider is nobody's sibling brand: jane@outlook.com on
+    # outlookdental.com ranked 1, above the site's own info@.
+    if a in FREE_LABELS:
+        return False
     if len(a) >= SIBLING_MIN_LABEL and len(b) >= SIBLING_MIN_LABEL and (a in b or b in a):
         return True
     return False

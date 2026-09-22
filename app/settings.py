@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     cache_days: int = 90
     connect_timeout_s: int = 3
     read_timeout_s: int = 7
+    # Direct fetches refuse hosts that resolve to private, loopback or link-local
+    # addresses (the worker shares a private network with Postgres, Redis and the
+    # portal). Off only for tests, which mock hosts that do not resolve.
+    fetch_guard_private_addresses: bool = True
     # 30s was sized when a domain fetched ~2 pages with no bucket contention. With the
     # early stop off (5 pages) and Jina paced at 500 rpm, a domain can spend most of its
     # budget queueing: 288 of 845 domains expired on the real list.

@@ -21,11 +21,13 @@ import logging
 import re
 from enum import Enum
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from pydantic import BaseModel
 
+from app import netguard
+from app.pipeline.htmlscan import Block, looks_emailish, strip_blocks
 from app.ratelimit import CircuitOpen, FetchGate, jittered
 from app.provider_keys import current as current_key
 from app.settings import settings
@@ -34,13 +36,18 @@ log = logging.getLogger("email_extractor.fetch")
 
 JINA_BASE = "https://r.jina.ai/"
 
-# Spec 15: a bot-challenge page must never be extracted from.
-BLOCK_MARKERS = ("just a moment", "attention required", "cf-chl", "captcha", "access denied")
+# Spec 15: a bot-challenge page must never be extracted from. The text markers are
+# matched against what the page SHOWS, not its markup: "captcha" in the raw HTML
+# matched every homepage that loads reCAPTCHA for its contact form (a `<script
+# src=".../recaptcha/api.js">` in the head, or a `g-recaptcha` class), and a blocked
+# homepage fails the whole domain. "cf-chl" is a Cloudflare challenge attribute, so it
+# alone is still looked for in the markup.
+BLOCK_TEXT_MARKERS = ("just a moment", "attention required", "captcha", "access denied")
+BLOCK_MARKUP_MARKERS = ("cf-chl",)
+BLOCK_MARKERS = BLOCK_TEXT_MARKERS + BLOCK_MARKUP_MARKERS
 
-_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script\s*>", re.I | re.S)
 _JSONLD_RE = re.compile(r"""type\s*=\s*["']?application/ld\+json""", re.I)
-_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.I | re.S)
-_SVG_RE = re.compile(r"<svg\b[^>]*>.*?</svg\s*>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]*>")
 
 
 class ErrorClass(str, Enum):
@@ -121,21 +128,33 @@ def parse_retry_after(value: str | None, cap: float = 30.0) -> float | None:
     return max(0.0, min((dt - now).total_seconds(), cap))
 
 
+def _keep_script(b: Block, body: str) -> bool:
+    """JSON-LD always; any other inline script only when it carries an address.
+
+    Dropping every script threw away `var email = "info@acme.com"` and the
+    `document.write` obfuscations, so the "script" extraction source only ever saw
+    failed JSON-LD. Kept scripts never reach the visible text (visible_text removes
+    them), so they can add an address but not pollute a context window.
+    """
+    return bool(_JSONLD_RE.search(b.attrs)) or looks_emailish(body)
+
+
 def strip_non_jsonld_scripts(html: str) -> str:
-    """Remove <script> blocks except JSON-LD, plus <style> and <svg> (Stage 4, both backends)."""
-
-    def repl(m: re.Match[str]) -> str:
-        return m.group(0) if _JSONLD_RE.search(m.group(1) or "") else " "
-
-    html = _SCRIPT_RE.sub(repl, html)
-    html = _STYLE_RE.sub(" ", html)
-    return _SVG_RE.sub(" ", html)
+    """Remove <script> blocks except JSON-LD and address-bearing ones, plus <style> and
+    <svg> (Stage 4, both backends). Linear in the page size."""
+    html = strip_blocks(html, "script", keep=_keep_script)
+    html = strip_blocks(html, "style")
+    return strip_blocks(html, "svg")
 
 
 def looks_blocked(status: int, html: str) -> bool:
     """Spec 15 bot-challenge detection."""
-    head = html[:4000].lower()
-    if any(m in head for m in BLOCK_MARKERS):
+    head = html[:8000]
+    low = head.lower()
+    if any(m in low for m in BLOCK_MARKUP_MARKERS):
+        return True
+    shown = _TAG_RE.sub(" ", strip_blocks(strip_blocks(head, "script"), "style")).lower()
+    if any(m in shown for m in BLOCK_TEXT_MARKERS):
         return True
     return status == 403
 
@@ -221,6 +240,39 @@ def _exc_to_fetch_error(exc: Exception, *, provider: bool = False) -> FetchError
     return FetchError(ErrorClass.BUG, "internal_error", f"{type(exc).__name__}: {exc}"[:200])
 
 
+# --- private-address guard (direct fetches only; Jina fetches from its own network) --
+
+MAX_REDIRECTS = 5
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+async def guard_url(url: str) -> None:
+    """Refuse a URL whose host resolves to any non-public address.
+
+    The check and the connect are two lookups, so a DNS-rebinding record with a zero
+    TTL could still slip between them; pinning the checked address is not done here
+    because a pinned connection to a shared IP (every Cloudflare-fronted site) would
+    be reused for other hosts with the wrong TLS name. A host that does not resolve is
+    left to httpx, which reports it as the same connect error it always did.
+    """
+    if not settings.fetch_guard_private_addresses:
+        return
+    parts = urlsplit(url)
+    host = parts.hostname
+    if not host:
+        return
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return
+    try:
+        await netguard.resolve_public(host, port)
+    except netguard.PrivateAddress as e:
+        raise FetchError(ErrorClass.PERMANENT, "private_address", host) from e
+    except OSError:
+        return
+
+
 # --- shared client (spec 16: one per worker process, keep-alive) ----------
 
 _client: httpx.AsyncClient | None = None
@@ -231,8 +283,7 @@ def get_client() -> httpx.AsyncClient:
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
             http2=False,
-            follow_redirects=True,
-            max_redirects=5,
+            follow_redirects=False,      # _raw_get follows by hand, guarding each hop
             timeout=httpx.Timeout(
                 connect=settings.connect_timeout_s,
                 read=settings.read_timeout_s,
@@ -297,17 +348,30 @@ class _BaseFetcher:
         raise last
 
     async def _raw_get(self, url: str, headers: dict[str, str] | None = None) -> tuple[httpx.Response, bytes]:
-        """GET with a hard byte cap (spec 15: truncate at MAX_PAGE_BYTES, still extract)."""
+        """GET with a hard byte cap (spec 15: truncate at MAX_PAGE_BYTES, still extract).
+
+        Redirects are followed by hand so that every hop, not only the first URL, is
+        checked against the private-address guard: a business site that 302s to
+        `http://[fd12::1]:8080/` would otherwise be fetched from inside the private
+        network and its body mined for addresses.
+        """
         client = get_client()
-        async with client.stream("GET", url, headers=headers) as r:
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in r.aiter_bytes():
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= settings.max_page_bytes:
-                    break
-            return r, b"".join(chunks)[: settings.max_page_bytes]
+        for _hop in range(MAX_REDIRECTS + 1):
+            await guard_url(url)
+            async with client.stream("GET", url, headers=headers, follow_redirects=False) as r:
+                location = r.headers.get("location")
+                if r.status_code in REDIRECT_STATUSES and location:
+                    url = urljoin(url, location)
+                    continue
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in r.aiter_bytes():
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= settings.max_page_bytes:
+                        break
+                return r, b"".join(chunks)[: settings.max_page_bytes]
+        raise httpx.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects")
 
 
 # --- httpx backend --------------------------------------------------------
@@ -373,9 +437,9 @@ class JinaFetcher(_BaseFetcher):
     # response overhead once it has stopped waiting on the target.
     CLIENT_MARGIN_S = 5.0
 
-    def __init__(self, gate: FetchGate) -> None:
+    def __init__(self, gate: FetchGate, direct_gate: FetchGate | None = None) -> None:
         super().__init__(gate)
-        self._text = HttpxFetcher(gate)
+        self._text = HttpxFetcher(direct_gate or build_direct_gate())
 
     def _timeout(self) -> httpx.Timeout:
         """Per-request, so direct target fetches keep the tight shared-client budget."""
@@ -426,7 +490,8 @@ class JinaFetcher(_BaseFetcher):
 
         async def go() -> FetchResult:
             client = get_client()
-            r = await client.get(JINA_BASE + url, headers=self._headers(), timeout=self._timeout())
+            r = await client.get(JINA_BASE + url, headers=self._headers(), timeout=self._timeout(),
+                                 follow_redirects=True)
             cls = classify_provider_status(r.status_code)
             if cls is not None:
                 if cls is ErrorClass.TRANSIENT and r.status_code == 429:
@@ -505,6 +570,19 @@ class JinaFetcher(_BaseFetcher):
 
 
 # --- factory --------------------------------------------------------------
+
+
+def build_direct_gate() -> FetchGate:
+    """Concurrency only, no rate limit, no provider breaker: these are our own requests
+    to business sites (robots.txt, sitemaps). They used to share the Jina gate, so
+    each one spent a Jina rate-limit token -- two of the ~11 per domain -- and was
+    refused whenever Jina's breaker was open."""
+    return FetchGate(
+        rate_per_minute=None,
+        global_concurrency=settings.global_fetch_concurrency,
+        per_domain_concurrency=settings.per_domain_concurrency,
+        provider="direct",
+    )
 
 
 def build_gate() -> FetchGate:

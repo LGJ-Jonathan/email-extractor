@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pydantic
-from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, Request
+from starlette.datastructures import UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +23,7 @@ from app import errors
 from app.auth import Principal, admin_key_usable, require_api_key
 from app.errors import ApiError
 from app.db import dispose_engine, get_session, get_sessionmaker
-from app.ingest import IngestError, detect_column, parse_bytes, preview
+from app.ingest import IngestError, ParsedFile, detect_column, parse_bytes, preview
 from app.models import Job, User
 from app.pipeline.fetch import ErrorClass, FetchError, build_fetcher
 from app.pipeline.run import process_input
@@ -225,24 +226,62 @@ async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
     return raw, file.filename or "upload.csv"
 
 
-@app.post("/jobs/preview", dependencies=[Depends(require_api_key)])
-async def jobs_preview(
-    file: UploadFile = File(...), column: str | None = Form(default=None)
-) -> dict:
+def _is_multipart(request: Request) -> bool:
+    return request.headers.get("content-type", "").lower().startswith("multipart/form-data")
+
+
+async def _form(request: Request):
+    """The multipart body, read only now -- after the API key has been checked.
+
+    As `File(...)` / `Form(...)` parameters, FastAPI parsed the body before it ran
+    any dependency, so an unauthenticated caller could have the API buffer 50 MB
+    uploads, as many at once as it liked, and only then be told 401. The
+    Content-Length check refuses the obvious cases before a byte is read.
+    """
+    if not _is_multipart(request):
+        raise ApiError("validation_error", "expected a multipart/form-data upload",
+                       details=[{"field": "file", "msg": "missing"}])
+    cap = settings.max_upload_bytes
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > cap + 65_536:
+        raise ApiError("file_too_large", f"file is over the {cap // (1024 * 1024)} MB limit",
+                       details={"limit_bytes": cap})
+    return await request.form(max_files=1, max_fields=8)
+
+
+def _form_str(form, name: str) -> str | None:
+    value = form.get(name)
+    return value if isinstance(value, str) and value != "" else None
+
+
+async def _parse_upload(file) -> tuple[bytes, str, ParsedFile]:
+    """Read and parse in a worker thread: a big or wide file takes seconds of pure
+    CPU, and on the event loop that stalled every other request, /healthz included."""
+    if not isinstance(file, UploadFile):
+        raise ApiError("validation_error", "the upload needs a file field named 'file'",
+                       details=[{"field": "file", "msg": "missing"}])
+    raw, filename = await _read_upload(file)
+    try:
+        parsed = await asyncio.to_thread(parse_bytes, raw, filename)
+    except IngestError as e:
+        raise ApiError(e.code, str(e)) from e
+    return raw, filename, parsed
+
+
+@app.post("/jobs/preview")
+async def jobs_preview(request: Request, who: Principal = Depends(require_api_key)) -> dict:
     """Spec 5: detect the website column and describe the file. Creates no job.
 
     Pass `column` to preview a different column than the detected one.
     """
     async with _upload_slot():
-        raw, filename = await _read_upload(file)
-        try:
-            parsed = parse_bytes(raw, filename)
-        except IngestError as e:
-            raise ApiError(e.code, str(e)) from e
+        form = await _form(request)
+        column = _form_str(form, "column")
+        _raw, filename, parsed = await _parse_upload(form.get("file"))
         if column and column not in parsed.headers:
             raise ApiError("unknown_column", f"the file has no column named {column!r}",
                            details={"columns": parsed.headers})
-        guess = detect_column(parsed)
+        guess = await asyncio.to_thread(detect_column, parsed)
         return {"filename": filename, **preview(parsed, guess, column=column)}
 
 
@@ -279,35 +318,33 @@ async def _replay(session: AsyncSession, who: Principal, key: str,
             "queued": counts["unique_domains"] - counts["cached"], "replayed": True}
 
 
+_TRUE = ("1", "true", "yes", "on")
+
+
 @app.post("/jobs")
 async def create_job(
     request: Request,
     who: Principal = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    file: UploadFile | None = File(default=None),
-    column: str | None = Form(default=None),
-    webhook_url: str | None = Form(default=None),
-    fresh: bool = Form(default=False),
 ) -> dict:
     """Spec 5: JSON body of items, or a multipart file upload."""
-    if file is not None:
+    if _is_multipart(request):
         async with _upload_slot():
-            return await _create_job(request, who, session, idempotency_key, file, column,
-                                     webhook_url, fresh)
-    return await _create_job(request, who, session, idempotency_key, None, column,
-                             webhook_url, fresh)
+            form = await _form(request)
+            return await _create_job(
+                request, who, session, idempotency_key, form.get("file"),
+                _form_str(form, "column"), _form_str(form, "webhook_url"),
+                (_form_str(form, "fresh") or "").lower() in _TRUE,
+            )
+    return await _create_job(request, who, session, idempotency_key, None, None, None, False)
 
 
 async def _create_job(request, who, session, idempotency_key, file, column, webhook_url,
                       fresh) -> dict:
     if file is not None:
-        raw, filename = await _read_upload(file)
-        try:
-            parsed = parse_bytes(raw, filename)
-        except IngestError as e:
-            raise ApiError(e.code, str(e)) from e
-        guess = detect_column(parsed)
+        raw, filename, parsed = await _parse_upload(file)
+        guess = await asyncio.to_thread(detect_column, parsed)
         if column and column not in parsed.headers:
             raise ApiError("unknown_column", f"the file has no column named {column!r}",
                            details={"columns": parsed.headers})
@@ -316,7 +353,7 @@ async def _create_job(request, who, session, idempotency_key, file, column, webh
             raise ApiError("no_website_column",
                            "no website column was detected; choose one and pass column=",
                            details={"columns": parsed.headers})
-        items = jobs_svc.prepare_items(parsed, guess, chosen)
+        items = await asyncio.to_thread(jobs_svc.prepare_items, parsed, guess, chosen)
         source_columns, source_name = parsed.headers, filename
         content = raw
     else:
@@ -541,12 +578,25 @@ async def results_csv(
                                         retrying=retrying)
                 )
 
-    name = (job.filename or "results").rsplit(".", 1)[0]
     return StreamingResponse(
         gen(),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{name}_extracted.csv"'},
+        headers={"Content-Disposition": _attachment(job.filename, "_extracted.csv")},
     )
+
+
+def _attachment(filename: str | None, suffix: str) -> str:
+    """RFC 6266: an ASCII fallback plus the UTF-8 name. The raw name went straight
+    into the header, so a Cyrillic or CJK upload name made every download a 500
+    (Starlette encodes headers as latin-1) and a quote in it broke the header."""
+    from urllib.parse import quote
+
+    name = (filename or "results").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    name = (name or "results") + suffix
+    ascii_name = "".join(c if c.isascii() and c.isalnum() or c in "-_. " else "_" for c in name)
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}'
 
 
 @app.get("/jobs/{job_id}/results.json")

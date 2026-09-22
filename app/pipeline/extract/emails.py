@@ -12,14 +12,13 @@ from app.pipeline.extract.cloudflare import decode_html
 from app.pipeline.extract.context import context_for, page_title, visible_text
 from app.pipeline.extract.normalize_html import normalize_html
 from app.pipeline.extract.patterns import EMAIL, EMAIL_FULL, clean
+from app.pipeline.htmlscan import bodies
 
 _extract = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
 
 # Highest precision first (spec 5c).
 METHOD_PRECEDENCE = ("mailto", "jsonld", "cloudflare", "text", "attribute", "script")
 _RANK = {m: i for i, m in enumerate(METHOD_PRECEDENCE)}
-
-_SCRIPT = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.I | re.S)
 
 
 @dataclass
@@ -42,6 +41,20 @@ _ASSET_TAIL = re.compile(
 )
 
 
+# `info@acme.com.Call us` -- the sentence runs straight on after the address and
+# `.call` is a real TLD, so the suffix check passed and `info@acme.com.call` came out.
+# Only a capitalised word glued after a common TLD is trimmed; `bob@acme.co.uk` and
+# `x@acme.com.au` have lowercase labels and are left alone.
+_GLUED_SENTENCE = re.compile(
+    r"^(.+\.(?:" + "|".join(TRIM_TARGETS) + r"))\.[A-Z][a-z]+$"
+)
+
+
+def unglue_sentence(raw: str) -> str:
+    m = _GLUED_SENTENCE.match(raw.strip().strip(".,;:!?)]}>\"'"))
+    return m.group(1) if m else raw
+
+
 def _version_like(domain: str) -> bool:
     """`18.2.0-canary.abc` is a package spec, not a host: several labels, some numeric."""
     labels = domain.split(".")
@@ -61,7 +74,10 @@ def fix_tld(email: str) -> str | None:
     labels = domain.split(".")
     last = labels[-1].lower()
     for target in TRIM_TARGETS:
-        if last.startswith(target) and len(last) > len(target) and last[len(target):].isalpha():
+        tail = last[len(target):]
+        # A one-letter tail is more often a TLD tldextract does not know (`.usa`)
+        # than glued text; trimming it rewrote `info@acme.usa` to `info@acme.us`.
+        if last.startswith(target) and len(tail) >= 2 and tail.isalpha():
             candidate = ".".join(labels[:-1] + [target])
             if _extract(candidate).suffix:
                 return f"{local}@{candidate}"
@@ -69,7 +85,7 @@ def fix_tld(email: str) -> str | None:
 
 
 def _accept(raw: str) -> str | None:
-    email = clean(raw)
+    email = clean(unglue_sentence(raw))
     if not email or not EMAIL_FULL.fullmatch(email):
         return None
     return fix_tld(email)
@@ -150,7 +166,7 @@ def extract_page(html: str, url: str) -> tuple[list[EmailCandidate], str, str]:
                         add(address, "attribute")
 
     # remaining inline script bodies
-    for body in _SCRIPT.findall(normalised):
+    for body in bodies(normalised, "script"):
         for address in EMAIL.findall(body):
             add(address, "script")
 

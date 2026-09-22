@@ -40,6 +40,7 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "job_already_finished": (409, "cancel on a job that is done, failed or cancelled"),
     "file_too_large": (413, "the upload or body is over the size limit"),
     "too_many_rows": (413, "over 50,000 rows or items"),
+    "too_many_columns": (413, "over 500 columns"),
     "unsupported_file_type": (415, "not a CSV, TSV, TXT or XLSX file"),
     "validation_error": (422, "a field is missing or has the wrong type; see details"),
     "empty_file": (422, "the file has no data"),

@@ -219,6 +219,7 @@ class CircuitBreaker:
     _open_for: float = field(default=0.0, init=False)
     _consecutive_opens: int = field(default=0, init=False)
     _probe_results: list[bool] = field(default_factory=list, init=False)
+    _probes_admitted: int = field(default=0, init=False)
     opened_count: int = field(default=0, init=False)
     # What actually pushed it open, so a trip is diagnosable after the fact.
     failure_reasons: dict[str, int] = field(default_factory=dict, init=False)
@@ -229,6 +230,7 @@ class CircuitBreaker:
         if self._state == "open" and time.monotonic() - self._opened_at >= self._open_for:
             self._state = "half_open"
             self._probe_results = []
+            self._probes_admitted = 0
         return self._state
 
     @property
@@ -252,9 +254,13 @@ class CircuitBreaker:
         state = self.state
         if state == "open":
             raise CircuitOpen(self.provider, self._open_for - (time.monotonic() - self._opened_at))
-        if state == "half_open" and len(self._probe_results) >= self.probes:
-            # Probes are in flight; hold callers back until they resolve.
-            raise CircuitOpen(self.provider, 1.0)
+        if state == "half_open":
+            # Admission is counted here, not when a probe reports back: counting
+            # results let every waiter through the moment the window ended (50 of
+            # 50 in the test), which is the burst the half-open state exists to avoid.
+            if self._probes_admitted >= self.probes:
+                raise CircuitOpen(self.provider, 1.0)
+            self._probes_admitted += 1
 
     def record(self, ok: bool, reason: str = "") -> None:
         if not ok and reason:
@@ -292,6 +298,7 @@ class CircuitBreaker:
         self._opened_at = now
         self._outcomes.clear()
         self._probe_results = []
+        self._probes_admitted = 0
         self.opened_count += 1
 
     def _close(self) -> None:

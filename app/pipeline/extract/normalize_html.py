@@ -22,10 +22,9 @@ values. Percent-decoding happens in the mailto extractor instead, where it belon
 
 import re
 
-_JSONLD_BLOCK = re.compile(
-    r"(<script[^>]*type\s*=\s*[\"']?application/ld\+json[^>]*>)(.*?)(</script\s*>)",
-    re.I | re.S,
-)
+from app.pipeline.htmlscan import iter_blocks
+
+_JSONLD_TYPE = re.compile(r"type\s*=\s*[\"']?application/ld\+json", re.I)
 
 _U_AT = re.compile(r"\\u0040|\\x40", re.I)
 _U_DOT = re.compile(r"\\u002e|\\x2e", re.I)
@@ -41,7 +40,9 @@ _BRACKET_AT = re.compile(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", re.I)
 _BRACKET_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
 
 # Rule 6, cue-gated. The cue may sit up to 40 characters before the local part.
-_CUE = r"(?:e-?mail|mail|contact|reach\s+us|write\s+to|enquir(?:y|ies)|inquir(?:y|ies))"
+# Whole words: without the boundary, "mail" matched inside "Gmail" and "Mailchimp", so
+# "Sign up with Gmail. Find us at acmeroofing dot com" produced us@acmeroofing.com.
+_CUE = r"\b(?:e-?mail|mail|contact|reach\s+us|write\s+to|enquir(?:y|ies)|inquir(?:y|ies))\b"
 _SPELLED = re.compile(
     rf"({_CUE}[^<>]{{0,40}}?\b)"
     r"([a-z0-9._%+\-]+)\s+at\s+([a-z0-9-]+)\s+dot\s+(com|net|org|us|co|biz|info|io)\b",
@@ -68,9 +69,11 @@ def normalize_html(html: str) -> str:
         return ""
     parts: list[str] = []
     last = 0
-    for m in _JSONLD_BLOCK.finditer(html):
-        parts.append(_normalise_fragment(html[last : m.start()]))
-        parts.append(m.group(0))          # JSON-LD untouched
-        last = m.end()
+    for b in iter_blocks(html, "script"):
+        if not _JSONLD_TYPE.search(b.attrs):
+            continue
+        parts.append(_normalise_fragment(html[last:b.start]))
+        parts.append(html[b.start:b.end])          # JSON-LD untouched
+        last = b.end
     parts.append(_normalise_fragment(html[last:]))
     return "".join(parts)

@@ -149,8 +149,9 @@ def csv_safe(value: str) -> str:
 
 
 def output_header(source_columns: list[str]) -> list[str]:
-    """Spec 14: the file's own columns first, then the ex_* result columns."""
-    return list(source_columns) + [EX_PREFIX + f for f in RESULT_FIELDS]
+    """Spec 14: the file's own columns first, then the ex_* result columns. Header names
+    came from the upload, so they get the same formula guard as the cells."""
+    return [csv_safe(c) for c in source_columns] + [EX_PREFIX + f for f in RESULT_FIELDS]
 
 
 def output_row(
