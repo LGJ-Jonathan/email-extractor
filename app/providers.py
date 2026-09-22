@@ -82,6 +82,9 @@ WHERE state = 'done' AND finished_at >= date_trunc('month', now())
 """)
 
 
+WORKER_SILENT_S = 120       # six missed heartbeats
+
+
 async def provider_status(session: AsyncSession) -> dict:
     global _cache
     from app import provider_keys
@@ -100,6 +103,25 @@ async def provider_status(session: AsyncSession) -> dict:
         **vendors,
         "usage_this_month": {k: int(v or 0) for k, v in usage.items()},
         "jina_low_threshold": settings.jina_low_balance_tokens,
+        "worker": await worker_health(session),
+    }
+
+
+async def worker_health(session: AsyncSession) -> dict:
+    """Is the worker alive? Its heartbeat writes process_status every 20 s, so a row
+    older than a couple of minutes means no worker is running, whatever the jobs say."""
+    row = (await session.execute(text(
+        "SELECT status, extract(epoch FROM now() - updated_at) AS age "
+        "FROM process_status WHERE name = 'worker'"
+    ))).first()
+    if row is None:
+        return {"status": "never_seen", "last_seen_s": None}
+    age = int(row.age)
+    health = (row.status or {}).get("health") or {}
+    return {
+        "status": "ok" if age < WORKER_SILENT_S else "silent",
+        "last_seen_s": age,
+        **{k: health.get(k) for k in ("in_flight", "concurrency", "last_claim_at", "breaker")},
     }
 
 

@@ -87,8 +87,9 @@ Every route except `/healthz` and `/` requires `X-API-Key`.
 | `GET /jobs/{id}/recent` | most recently finished domains |
 | `GET /jobs/{id}/results.csv` / `.json` | uploaded columns + `ex_*` result columns, row order; unfinished rows `pending` |
 | `POST /jobs/{id}/resume` / `cancel` | resume a paused job / stop one |
+| `POST /jobs/{id}/retry` | send the job's retryable failures (unreachable, slow, provider trouble, gave up) back to the queue; finished rows keep their results, a done job goes back to running |
 | `GET /estimate?domains=N` | time range for N domains at this person's fair share of recent speed |
-| `GET /providers/status` | Jina balance, TypeSafe key status, this month's usage |
+| `GET /providers/status` | Jina balance, TypeSafe key status, this month's usage, and `worker`: `ok` / `silent` / `never_seen` with `last_seen_s`, `in_flight`, `last_claim_at` and the breaker state, so a stalled worker does not look like a slow job |
 | `GET` / `PUT` / `DELETE /providers/keys[/{jina\|typesafe}]` | admin: view / check-and-save / remove provider keys |
 | `POST /extract` | one domain, synchronously |
 
@@ -314,4 +315,5 @@ Section 15 edge cases are implemented inside the step that owns their stage.
 - [x] 8. Jobs API, Postgres queue (replaces arq), per-user keys, cache, CSV/JSON, webhook, upload page (§14)
 - [x] Portal integration: service key + acting user, error contract, estimates, provider keys; on Railway
 - [x] Fourth review pass: queue races, quadratic regexes, private-address guard, upload limits
+- [x] Retry failed domains (`POST /jobs/{id}/retry`), worker liveness in `/providers/status`
 - [ ] 9. 5k soak test through the running service, then 50k (needs Jina credit)

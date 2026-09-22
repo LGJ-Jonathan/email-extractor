@@ -655,6 +655,26 @@ async def _current_status(session: AsyncSession, job: Job) -> str:
     )
 
 
+@app.post("/jobs/{job_id}/retry")
+async def retry_job(
+    job_id: str,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Send the job's retryable failures (unreachable, slow, provider trouble) back to
+    the queue. Finished rows keep their results; the download only gets better.
+    A done job goes back to running; nothing happens to a job with none to retry."""
+    job = await _get_job(session, job_id, who)
+    status = await _current_status(session, job)
+    if status in ("paused", "cancelled"):
+        raise ApiError("job_not_retryable", f"the job is {status}; resume it first"
+                       if status == "paused" else "the job was cancelled",
+                       details={"status": status})
+    requeued = await queue.requeue_failed(session, job.id)
+    return {"job_id": str(job.id), "requeued": requeued,
+            "status": await _current_status(session, job)}
+
+
 @app.post("/jobs/{job_id}/resume")
 async def resume_job(
     job_id: str,

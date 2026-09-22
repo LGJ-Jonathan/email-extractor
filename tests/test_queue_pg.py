@@ -1311,3 +1311,125 @@ async def test_the_sweep_completes_a_job_that_slipped_through(db):
         assert await queue.complete_finished_jobs(s) == 1
         assert await queue.complete_finished_jobs(s) == 0
         assert await job_status(s, job.id) == "done"
+
+
+# --- retry failed domains, worker health ------------------------------------------
+
+
+async def _finish_all(db, job_id, *, status, reason=None, site_status=None):
+    from app import queue
+    from app.schemas import DomainResult
+
+    while True:
+        async with db() as s:
+            c = await queue.claim(s, "w")
+            if c is None or c.job_id != job_id:
+                return
+            await queue.finish(s, c, DomainResult(domain=c.domain, status=status,
+                                                  error_reason=reason, site_status=site_status),
+                               from_cache=False)
+
+
+async def test_retry_requeues_transient_failures_and_bypasses_their_cached_result(db, api_key):
+    import httpx
+
+    from app import queue
+    from app.main import app
+
+    job = await make_job(db, ["slow.com", "gone.com", "fine.com"])
+    async with db() as s:
+        # slow.com timed out, gone.com was a real answer, fine.com was found.
+        for domain, status, reason in (("slow.com", "fetch_failed", "domain_timeout"),
+                                       ("gone.com", "no_contact_info", None),
+                                       ("fine.com", "found", None)):
+            c = await queue.claim(s, "w")
+            while c.domain != domain:
+                await queue.requeue(s, c, 0, count_attempt=False)
+                c = await queue.claim(s, "w")
+            from app.schemas import DomainResult
+            await queue.finish(s, c, DomainResult(domain=domain, status=status,
+                                                  error_reason=reason,
+                                                  best_email="a@fine.com" if status == "found" else None),
+                               from_cache=False)
+        assert await job_status(s, job.id) == "done"
+
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.post(f"/jobs/{job.id}/retry", headers=h)
+        assert r.status_code == 200
+        assert r.json() == {"job_id": str(job.id), "requeued": 1, "status": "running"}
+        # Nothing left to retry: still fine, still running (the row is queued).
+        assert (await c.post(f"/jobs/{job.id}/retry", headers=h)).json()["requeued"] == 0
+
+    async with db() as s:
+        rows = dict((await s.execute(text(
+            "SELECT domain, state FROM job_domains WHERE job_id = :j"), {"j": job.id})).all())
+        assert rows == {"slow.com": "queued", "gone.com": "done", "fine.com": "done"}
+        # The failure it is retrying is in the shared cache, finished after the job
+        # was created; the requeued row must not read it back.
+        claim = await queue.claim(s, "w")
+        assert claim.domain == "slow.com" and claim.attempts == 1 and claim.not_before
+        job_row = await s.get(__import__("app.models", fromlist=["Job"]).Job, job.id)
+        assert await queue.cached_result(s, job_row, "slow.com") is not None      # without the floor
+        assert await queue.cached_result(s, job_row, "slow.com", claim.not_before) is None
+
+
+async def test_retry_refuses_paused_and_cancelled_jobs(db, api_key):
+    import httpx
+
+    from app.main import app
+
+    job = await make_job(db, ["x.com"])
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async with db() as s:
+            await s.execute(text("UPDATE jobs SET status = 'paused', pause_reason = 'jina_account'"))
+            await s.commit()
+        r = await c.post(f"/jobs/{job.id}/retry", headers=h)
+        assert r.status_code == 409 and r.json()["error"]["code"] == "job_not_retryable"
+        async with db() as s:
+            await s.execute(text("UPDATE jobs SET status = 'cancelled'"))
+            await s.commit()
+        assert (await c.post(f"/jobs/{job.id}/retry", headers=h)).status_code == 409
+
+
+async def test_retry_books_the_time_a_job_sat_finished_as_paused(db):
+    from app import queue
+
+    job = await make_job(db, ["t.com"])
+    await _finish_all(db, job.id, status="fetch_failed", reason="homepage")
+    async with db() as s:
+        await s.execute(text(
+            "UPDATE jobs SET finished_at = now() - interval '1 hour', "
+            "started_at = now() - interval '2 hours'"))
+        await s.commit()
+        assert await queue.requeue_failed(s, job.id) == 1
+        row = (await s.execute(text(
+            "SELECT status::text, finished_at, paused_seconds FROM jobs WHERE id = :j"),
+            {"j": job.id})).one()
+    assert row[0] == "running" and row[1] is None and 3590 < row[2] < 3610
+
+
+async def test_worker_health_is_written_on_heartbeat_and_read_by_status(db, monkeypatch):
+    from app import provider_keys
+    from app.providers import worker_health
+    from app.worker import Worker
+
+    provider_keys.set_process_name("worker")
+    w = Worker(concurrency=7, fetcher=object())
+    w._live.add("w|abc")
+    async with db() as s:
+        await provider_keys.refresh(s, force=True)          # the key report
+        await provider_keys.report_health(s, w.health())    # must not overwrite it
+        row = await s.scalar(text("SELECT status FROM process_status WHERE name = 'worker'"))
+        assert row["health"]["in_flight"] == 1 and row["health"]["concurrency"] == 7
+        assert "jina" in row                                # the key report survived
+        health = await worker_health(s)
+        assert health["status"] == "ok" and health["in_flight"] == 1
+        await s.execute(text("UPDATE process_status SET updated_at = now() - interval '10 minutes'"))
+        await s.commit()
+        assert (await worker_health(s))["status"] == "silent"
+    async with db() as s:
+        await s.execute(text("DELETE FROM process_status"))
+        await s.commit()
+        assert (await worker_health(s))["status"] == "never_seen"

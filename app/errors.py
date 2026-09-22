@@ -37,6 +37,7 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "not_found": (404, "no such route"),
     "method_not_allowed": (405, "wrong HTTP method for this route"),
     "job_not_paused": (409, "resume on a job that is not paused"),
+    "job_not_retryable": (409, "retry on a paused or cancelled job"),
     "job_already_finished": (409, "cancel on a job that is done, failed or cancelled"),
     "file_too_large": (413, "the upload or body is over the size limit"),
     "too_many_rows": (413, "over 50,000 rows or items"),

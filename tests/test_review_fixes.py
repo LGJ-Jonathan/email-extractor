@@ -294,6 +294,9 @@ async def test_provider_status_returns_only_balances(monkeypatch):
                 def all(self):              # provider_keys.refresh: no saved keys
                     return []
 
+                def first(self):            # worker_health: no process_status row
+                    return None
+
                 def mappings(self):
                     class M:
                         def one(self):

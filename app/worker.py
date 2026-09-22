@@ -12,7 +12,9 @@ import logging
 import os
 import signal
 import socket
+import time
 import uuid
+from datetime import UTC, datetime
 
 from app import queue
 from app.db import dispose_engine, get_sessionmaker
@@ -42,6 +44,7 @@ class Worker:
         self.webhooks = WebhookSender()
         self._tasks: set[asyncio.Task] = set()
         self._live: set[str] = set()       # claim tokens with a handler still running
+        self._last_claim_at: float | None = None
         self._stopping = asyncio.Event()
 
     def stop(self) -> None:
@@ -88,6 +91,8 @@ class Worker:
                     except TimeoutError:
                         pass
                     continue
+
+                self._last_claim_at = time.time()
 
                 async def run_one(c=c):
                     self._live.add(c.token)
@@ -137,6 +142,7 @@ class Worker:
             try:
                 async with self.sessions() as s:
                     await queue.heartbeat(s, list(self._live))
+                    await provider_keys.report_health(s, self.health())
             except Exception:  # noqa: BLE001
                 log.exception("heartbeat_failed")
             try:
@@ -145,6 +151,26 @@ class Worker:
                     await provider_keys.refresh(s)
             except Exception:  # noqa: BLE001
                 log.exception("provider_key_refresh_failed")
+
+    def health(self) -> dict:
+        """What the portal's status strip shows so a stalled worker does not look
+        like a slow job: in flight, when work was last picked up, breaker state."""
+        breaker = getattr(getattr(self.fetcher, "gate", None), "breaker", None)
+        out = {
+            "worker": self.id,
+            "concurrency": self.concurrency,
+            "in_flight": len(self._live),
+            "last_claim_at": (datetime.fromtimestamp(self._last_claim_at, UTC).isoformat()
+                              if self._last_claim_at else None),
+        }
+        if breaker is not None:
+            out["breaker"] = {
+                "state": breaker.state,
+                "open_for_s": round(breaker.open_for, 1),
+                "opened_count": breaker.opened_count,
+                "last_open_reasons": dict(breaker.last_open_reasons),
+            }
+        return out
 
     async def _reap_loop(self) -> None:
         while True:
@@ -182,7 +208,7 @@ class Worker:
             job = await s.get(Job, c.job_id)
             if job is None:
                 return
-            cached = await queue.cached_result(s, job, c.domain)
+            cached = await queue.cached_result(s, job, c.domain, c.not_before)
             if cached is not None:
                 await self._finish(s, job, c, cached, from_cache=True)
                 return
@@ -198,7 +224,7 @@ class Worker:
                 await queue.requeue(s, c, queue.LOCK_BUSY_DELAY_S, count_attempt=False)
                 return
             # The other job may have finished it between the cache check and the lock.
-            cached = await queue.cached_result(s, job, c.domain)
+            cached = await queue.cached_result(s, job, c.domain, c.not_before)
             if cached is not None:
                 await queue.unlock_domain(s, c)
                 await self._finish(s, job, c, cached, from_cache=True)

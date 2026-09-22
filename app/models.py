@@ -155,6 +155,9 @@ class JobDomain(Base):
                                            server_default="false")
     has_linkedin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
                                                server_default="false")
+    # Set when a finished row is sent back for another try (POST /jobs/{id}/retry).
+    # A cached result older than this is the failure being retried, so it is not reused.
+    requeued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_job_domains_job_state_seq", "job_id", "state", "seq"),

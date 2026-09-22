@@ -142,18 +142,33 @@ async def _report(session: AsyncSession) -> None:
     status = {p: {"source": source(p), "last4": (current(p) or "")[-4:] or None}
               for p in PROVIDERS}
     try:
-        await session.execute(
-            text("""
-                INSERT INTO process_status (name, status, updated_at)
-                VALUES (:n, CAST(:s AS jsonb), now())
-                ON CONFLICT (name) DO UPDATE SET status = CAST(:s AS jsonb), updated_at = now()
-            """),
-            {"n": _process_name, "s": json.dumps(status)},
-        )
-        await session.commit()
+        await _merge_status(session, status)
     except Exception:  # noqa: BLE001 - reporting must never break key loading
         await session.rollback()
         log.exception("process_status_report_failed")
+
+
+async def _merge_status(session: AsyncSession, fields: dict) -> None:
+    """Merge into this process's row (jsonb ||), so the key report and the worker's
+    health report do not overwrite each other."""
+    import json
+
+    await session.execute(
+        text("""
+            INSERT INTO process_status (name, status, updated_at)
+            VALUES (:n, CAST(:s AS jsonb), now())
+            ON CONFLICT (name) DO UPDATE
+            SET status = process_status.status || CAST(:s AS jsonb), updated_at = now()
+        """),
+        {"n": _process_name, "s": json.dumps(fields)},
+    )
+    await session.commit()
+
+
+async def report_health(session: AsyncSession, health: dict) -> None:
+    """The worker's liveness, written on every heartbeat under "health"."""
+    if _process_name:
+        await _merge_status(session, {"health": health})
 
 
 async def processes(session: AsyncSession) -> dict:

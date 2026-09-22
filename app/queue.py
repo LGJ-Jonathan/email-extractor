@@ -38,6 +38,7 @@ class Claim:
     domain: str
     attempts: int       # including this one
     token: str          # this claim alone; see new_token
+    not_before: datetime | None = None   # cached results older than this are not reused
 
 
 def new_token(worker: str) -> str:
@@ -84,7 +85,7 @@ FROM (
     FOR UPDATE SKIP LOCKED
 ) pick
 WHERE jd.job_id = pick.job_id AND jd.domain = pick.domain
-RETURNING jd.domain, jd.attempts
+RETURNING jd.domain, jd.attempts, jd.requeued_at
 """)
 
 
@@ -106,33 +107,38 @@ async def claim(session: AsyncSession, worker: str) -> Claim | None:
             {"j": job_id},
         )
         await session.commit()
-        return Claim(job_id=job_id, domain=row[0], attempts=row[1], token=token)
+        return Claim(job_id=job_id, domain=row[0], attempts=row[1], token=token,
+                     not_before=row[2])
     await session.rollback()
     return None
 
 
 def cache_usable(job: Job, finished_at: datetime | None, status: str | None,
-                 result: dict | None) -> bool:
+                 result: dict | None, not_before: datetime | None = None) -> bool:
     """A finished result this job may reuse instead of fetching.
 
     Anything finished after the job was created is as fresh as a fetch would be, even a
     fetch_failed (it failed moments ago; failing again costs tokens for nothing). Older
     results obey the cache rules: CACHE_DAYS, never fetch_failed, never for fresh jobs.
+    `not_before` (a retried row's requeued_at) moves that line: the failure being
+    retried was itself written to the cache after the job was created.
     """
     if finished_at is None or not result:
         return False
-    if finished_at >= job.created_at:
+    floor = max(job.created_at, not_before) if not_before else job.created_at
+    if finished_at >= floor:
         return True
     if job.fresh or status == "fetch_failed":
         return False
     return finished_at >= datetime.now(UTC) - timedelta(days=settings.cache_days)
 
 
-async def cached_result(session: AsyncSession, job: Job, domain: str) -> DomainResult | None:
+async def cached_result(session: AsyncSession, job: Job, domain: str,
+                        not_before: datetime | None = None) -> DomainResult | None:
     row = (await session.execute(
         text("SELECT finished_at, status, result FROM domains WHERE domain = :d"), {"d": domain}
     )).first()
-    if row is None or not cache_usable(job, row[0], row[1], row[2]):
+    if row is None or not cache_usable(job, row[0], row[1], row[2], not_before):
         return None
     try:
         return DomainResult.model_validate(row[2])
@@ -279,6 +285,51 @@ async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
     if commit:
         await session.commit()
     return row is not None
+
+
+# Failures worth another go: the provider or the site was unreachable, slow, or we
+# gave up on it, as opposed to a site that answered and had nothing (not_found,
+# parked, blocked, not_html, ...). Re-running exactly these by hand after the 16k run
+# lifted its found rate from 44% to 55%.
+RETRYABLE_FAILURE_REASONS = ("homepage", "dns", "circuit_open", "domain_timeout",
+                             "internal_error", "private_address")
+
+
+async def requeue_failed(session: AsyncSession, job_id: uuid.UUID) -> int:
+    """Send a job's retryable fetch_failed rows back to the queue for a fresh try.
+
+    The old result stays on the row until the new one replaces it (downloads show
+    the row as pending meanwhile). Attempts restart, and requeued_at stops the row
+    reading its own old failure back out of the shared cache. A done job goes back
+    to running; the time it sat finished is booked as paused so it is not counted
+    as active.
+    """
+    rows = (await session.execute(
+        text("""
+            UPDATE job_domains
+            SET state = 'queued', attempts = 0, claimed_by = NULL, heartbeat_at = NULL,
+                available_at = now(), requeued_at = now()
+            WHERE job_id = :j AND state = 'done' AND status = 'fetch_failed'
+              AND (result->>'error_reason' = ANY(:reasons)
+                   OR result->>'site_status' = 'too_many_attempts')
+            RETURNING domain
+        """),
+        {"j": job_id, "reasons": list(RETRYABLE_FAILURE_REASONS)},
+    )).all()
+    if rows:
+        await session.execute(
+            text("""
+                UPDATE jobs
+                SET status = 'running',
+                    paused_seconds = paused_seconds
+                        + coalesce(extract(epoch FROM now() - finished_at), 0),
+                    finished_at = NULL
+                WHERE id = :j AND status = 'done'
+            """),
+            {"j": job_id},
+        )
+    await session.commit()
+    return len(rows)
 
 
 async def pause_active_jobs(session: AsyncSession, reason: str) -> None:
