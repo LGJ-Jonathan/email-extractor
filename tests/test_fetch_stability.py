@@ -544,3 +544,28 @@ def test_a_first_successful_key_read_counts_as_a_change_so_the_worker_retries():
     before = pk.signature("jina")
     pk._loaded_at = 1.0
     assert pk.signature("jina") != before
+
+
+# --- the bracket patterns were quadratic in whitespace runs --------------------------
+
+
+def test_bracketed_obfuscation_still_decodes():
+    from app.pipeline.extract.normalize_html import normalize_html
+
+    assert normalize_html("acmeroof [at] gmail [dot] com") == "acmeroof@gmail.com"
+    assert normalize_html("info(at)acme(dot)com") == "info@acme.com"
+    assert normalize_html("info  { AT }  acme  { DOT }  com") == "info@acme.com"
+    assert normalize_html("a [at] b [dot] c and x [at] y [dot] z") == "a@b.c and x@y.z"
+    assert normalize_html("<p>plain text (licensed) [insured]</p>") == "<p>plain text (licensed) [insured]</p>"
+
+
+def test_normalising_a_large_whitespace_heavy_page_is_fast():
+    import time
+
+    from app.pipeline.extract.normalize_html import normalize_html
+
+    row = '   <div class="col">\\n\\n   <p>Roofers (licensed) [insured].</p>\\n' + " " * 400 + "\\n"
+    html = "<html><body>" + row * 2200 + "</body></html>"
+    t = time.perf_counter()
+    assert normalize_html(html) == html
+    assert time.perf_counter() - t < 0.5          # was 2.7 s

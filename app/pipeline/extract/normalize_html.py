@@ -36,8 +36,33 @@ _PCT_AT = re.compile(r"%40", re.I)
 
 _ZERO_WIDTH = re.compile(r"[​‌‍﻿­⁠]")
 
-_BRACKET_AT = re.compile(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", re.I)
-_BRACKET_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
+# The bracketed forms, WITHOUT the surrounding whitespace in the pattern. Written as
+# `\s*[...]\s*` the leading `\s*` made the scan quadratic in the length of every
+# whitespace run: a 1 MB page indented with long runs took 1.4 s per pattern, on the
+# event loop's thread pool, and with whole pages (FETCH_BACKEND=hybrid) that pinned
+# the worker's core and stalled it. The whitespace is trimmed by hand in _sub_trim.
+_BRACKET_AT = re.compile(r"[\[\(\{]\s{0,8}at\s{0,8}[\]\)\}]", re.I)
+_BRACKET_DOT = re.compile(r"[\[\(\{]\s{0,8}dot\s{0,8}[\]\)\}]", re.I)
+
+
+def _sub_trim(pattern: re.Pattern, repl: str, text: str) -> str:
+    """pattern -> repl, also swallowing the whitespace on both sides of each match.
+    Linear in the text: `foo [at] bar` -> `foo@bar`."""
+    out: list[str] = []
+    last = 0
+    n = len(text)
+    for m in pattern.finditer(text):
+        if m.start() < last:
+            continue
+        out.append(text[last:m.start()].rstrip())
+        out.append(repl)
+        last = m.end()
+        while last < n and text[last].isspace():
+            last += 1
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
 
 # Rule 6, cue-gated. The cue may sit up to 40 characters before the local part.
 # Whole words: without the boundary, "mail" matched inside "Gmail" and "Mailchimp", so
@@ -57,8 +82,8 @@ def _normalise_fragment(text: str) -> str:
     text = _ENT_DOT.sub(".", text)
     text = _PCT_AT.sub("@", text)
     text = _ZERO_WIDTH.sub("", text)
-    text = _BRACKET_AT.sub("@", text)
-    text = _BRACKET_DOT.sub(".", text)
+    text = _sub_trim(_BRACKET_AT, "@", text)
+    text = _sub_trim(_BRACKET_DOT, ".", text)
     text = _SPELLED.sub(lambda m: f"{m.group(1)}{m.group(2)}@{m.group(3)}.{m.group(4)}", text)
     return text
 
