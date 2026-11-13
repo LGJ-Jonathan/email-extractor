@@ -277,7 +277,11 @@ class Worker:
                 await queue.requeue(s, c, settings.retry_pass_delay_s)
                 return
             job = await s.get(Job, c.job_id)
-            await self._finish(s, job, c, result, from_cache=False)
+            # A provider-fault result (circuit_open, dns_timeout) says nothing about
+            # the site, so it stays in this job and never reaches the shared cache
+            # that other jobs read.
+            await self._finish(s, job, c, result, from_cache=False,
+                               write_cache=result.error_reason not in RETRYABLE_DOMAIN_REASONS)
 
     async def _finish(self, s, job: Job | None, c: queue.Claim, result: DomainResult,
                       *, from_cache: bool, write_cache: bool = True) -> None:

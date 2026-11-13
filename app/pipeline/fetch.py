@@ -266,8 +266,14 @@ async def guard_url(url: str) -> None:
     The check and the connect are two lookups, so a DNS-rebinding record with a zero
     TTL could still slip between them; pinning the checked address is not done here
     because a pinned connection to a shared IP (every Cloudflare-fronted site) would
-    be reused for other hosts with the wrong TLS name. A host that does not resolve is
-    left to httpx, which reports it as the same connect error it always did.
+    be reused for other hosts with the wrong TLS name. That window is closed after
+    the connect instead: _raw_get checks the address it actually reached before it
+    reads a byte of the body.
+
+    A lookup that FAILS is refused too. It used to be waved through ("httpx will
+    report it"), but httpx does its own lookup, and a guard that cannot see the
+    answer must not assume it is public: the platform resolver does drop queries
+    under load, which is exactly when that mattered.
     """
     if not settings.fetch_guard_private_addresses:
         return
@@ -283,8 +289,56 @@ async def guard_url(url: str) -> None:
         await netguard.resolve_public(host, port)
     except netguard.PrivateAddress as e:
         raise FetchError(ErrorClass.PERMANENT, "private_address", host) from e
-    except OSError:
+    except OSError as e:
+        raise FetchError(ErrorClass.TRANSIENT, "homepage", "address check failed") from e
+
+
+def _check_peer(response: httpx.Response) -> None:
+    """Refuse a response that came from a non-public address (DNS rebinding: the
+    name answered publicly for the guard and privately for the connect)."""
+    if not settings.fetch_guard_private_addresses:
         return
+    stream = response.extensions.get("network_stream")
+    if stream is None:
+        return
+    addr = stream.get_extra_info("server_addr")
+    if not addr:
+        return
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(str(addr[0]).split("%")[0])
+    except ValueError:
+        return
+    if not netguard.is_public(ip):
+        raise FetchError(ErrorClass.PERMANENT, "private_address", response.url.host)
+
+
+def _inflate(raw: bytes, encoding: str, limit: int) -> bytes:
+    """Decompress at most `limit` bytes of output.
+
+    httpx's own decoding has no output limit: one 64 KB gzip chunk can inflate to
+    tens of megabytes before a byte count on the decoded stream is ever consulted,
+    and stacked encodings multiply that. So the body is read raw, capped compressed,
+    and inflated here with a ceiling."""
+    import zlib
+
+    encoding = encoding.strip().lower()
+    if encoding in ("", "identity"):
+        return raw[:limit]
+    if encoding in ("gzip", "x-gzip"):
+        modes = (16 + zlib.MAX_WBITS,)
+    elif encoding == "deflate":
+        modes = (zlib.MAX_WBITS, -zlib.MAX_WBITS)      # zlib-wrapped, then raw
+    else:
+        # br/zstd are never asked for, and a list ("gzip, gzip") is a bomb's shape.
+        raise FetchError(ErrorClass.PERMANENT, "not_html", f"content-encoding {encoding[:30]}")
+    for wbits in modes:
+        try:
+            return zlib.decompressobj(wbits).decompress(raw, limit)
+        except zlib.error:
+            continue
+    raise FetchError(ErrorClass.PERMANENT, "not_html", "undecodable body")
 
 
 # --- shared client (spec 16: one per worker process, keep-alive) ----------
@@ -314,7 +368,8 @@ def _new_client(*, max_connections: int, keepalive: int) -> httpx.AsyncClient:
             max_connections=max_connections,
             max_keepalive_connections=keepalive,
         ),
-        headers={"User-Agent": settings.user_agent},
+        # Only what _inflate can decode with a ceiling.
+        headers={"User-Agent": settings.user_agent, "Accept-Encoding": "gzip, deflate"},
     )
 
 
@@ -326,12 +381,6 @@ def get_client() -> httpx.AsyncClient:
         # counts against the pool for a moment after its slot is released.
         n = settings.global_fetch_concurrency
         _client = _new_client(max_connections=n + max(10, n // 5), keepalive=20)
-        if settings.fetch_backend == "hybrid":
-            _client.headers.update({
-                "User-Agent": settings.direct_user_agent,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
     return _client
 
 
@@ -365,9 +414,14 @@ class _BaseFetcher:
     def __init__(self, gate: FetchGate) -> None:
         self.gate = gate
 
-    async def _attempt_with_retries(self, url: str, domain: str, fn) -> FetchResult:
+    async def _attempt_with_retries(self, url: str, domain: str, fn,
+                                    retries: bool = True) -> FetchResult:
+        """`retries=False` makes one attempt: for a fetch that has a fallback behind
+        it, or is itself an optional extra, where three slow tries cost more than
+        the page is worth."""
         last: FetchError | None = None
-        for attempt in range(len(self.RETRY_DELAYS) + 1):
+        delays = self.RETRY_DELAYS if retries else ()
+        for attempt in range(len(delays) + 1):
             try:
                 async with self.gate.slot(domain):
                     result = await fn()
@@ -380,17 +434,19 @@ class _BaseFetcher:
                 last = e
                 if self.provider_backed:
                     self.gate.breaker.record(not e.provider, e.detail or e.reason)
-                if not e.retryable or attempt >= len(self.RETRY_DELAYS):
+                if not e.retryable or attempt >= len(delays):
                     raise
-                await asyncio.sleep(e.retry_after or jittered(self.RETRY_DELAYS[attempt]))
+                await asyncio.sleep(e.retry_after or jittered(delays[attempt]))
             except Exception as e:  # noqa: BLE001
                 err = _exc_to_fetch_error(e, provider=self.provider_backed)
                 last = err
-                if self.provider_backed:
+                # A full pool of OUR connections is no evidence either way about the
+                # provider: not a failure, and not a successful half-open probe.
+                if self.provider_backed and not isinstance(e, httpx.PoolTimeout):
                     self.gate.breaker.record(not err.provider, err.detail or err.reason)
-                if not err.retryable or attempt >= len(self.RETRY_DELAYS):
+                if not err.retryable or attempt >= len(delays):
                     raise err from e
-                await asyncio.sleep(jittered(self.RETRY_DELAYS[attempt]))
+                await asyncio.sleep(jittered(delays[attempt]))
         assert last is not None
         raise last
 
@@ -410,14 +466,17 @@ class _BaseFetcher:
                 if r.status_code in REDIRECT_STATUSES and location:
                     url = urljoin(url, location)
                     continue
+                _check_peer(r)
                 chunks: list[bytes] = []
                 total = 0
-                async for chunk in r.aiter_bytes():
+                async for chunk in r.aiter_raw():
                     chunks.append(chunk)
                     total += len(chunk)
                     if total >= settings.max_page_bytes:
                         break
-                return r, b"".join(chunks)[: settings.max_page_bytes]
+                raw = b"".join(chunks)[: settings.max_page_bytes]
+                return r, _inflate(raw, r.headers.get("content-encoding", ""),
+                                   settings.max_page_bytes)
         raise httpx.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects")
 
 
@@ -427,11 +486,16 @@ class _BaseFetcher:
 class HttpxFetcher(_BaseFetcher):
     """Direct fetching. Also serves get_text for every backend (deviation 3)."""
 
-    async def get_html(self, url: str, *, domain: str | None = None) -> FetchResult:
+    # Extra request headers for page fetches (hybrid sends a browser's). Per fetcher,
+    # not on the shared client, which TypeSafe calls also go through.
+    page_headers: dict[str, str] | None = None
+
+    async def get_html(self, url: str, *, domain: str | None = None,
+                       retry: bool = True) -> FetchResult:
         d = domain or host_of(url)
 
         async def go() -> FetchResult:
-            r, raw = await self._raw_get(url)
+            r, raw = await self._raw_get(url, self.page_headers)
             ctype = r.headers.get("content-type", "")
             body = decode_body(raw, r)
             cls = classify_site_status(r.status_code, body)
@@ -450,7 +514,7 @@ class HttpxFetcher(_BaseFetcher):
                 bytes=len(raw),
             )
 
-        return await self._attempt_with_retries(url, d, go)
+        return await self._attempt_with_retries(url, d, go, retries=retry)
 
     async def get_text(self, url: str, *, domain: str | None = None) -> FetchResult:
         d = domain or host_of(url)
@@ -505,7 +569,7 @@ class JinaFetcher(_BaseFetcher):
         # JINA_RENDER_ENGINE names one.
         engine = settings.jina_render_engine if render else "direct"
         timeout_s = settings.jina_render_timeout_s if render else settings.jina_timeout_s
-        return {
+        h = {
             **({"X-Engine": engine} if engine else {}),
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
@@ -537,6 +601,12 @@ class JinaFetcher(_BaseFetcher):
             # dominate a job's spend (one homepage measured 81,817 tokens alone).
             "X-Token-Budget": str(settings.max_page_tokens),
         }
+        if render:
+            # A rendered fetch is the last look at a site where the trimmed regions
+            # showed no address, so it reads the whole page. On 260 real sites, 34 of
+            # 59 "no contact info" results had an address outside those regions.
+            del h["X-Target-Selector"]
+        return h
 
     async def get_html(self, url: str, *, domain: str | None = None,
                        render: bool = False) -> FetchResult:
@@ -544,22 +614,22 @@ class JinaFetcher(_BaseFetcher):
 
         async def go() -> FetchResult:
             client = get_provider_client()
-            # One key per request, in rotation across the pool.
-            key = provider_keys.current("jina")
-            r = await client.get(JINA_BASE + url, headers=self._headers(key, render),
-                                 timeout=self._timeout(render), follow_redirects=True)
-            cls = classify_provider_status(r.status_code)
+            # One key per request, in rotation across the pool. A key that is rejected
+            # or out of credit is benched and the next one tried, here rather than
+            # through the retry loop: with several dead keys that loop's three
+            # attempts ran out and the page was failed while good keys remained.
+            for _ in range(len(provider_keys.entries("jina")) + 1):
+                key = provider_keys.current("jina")
+                r = await client.get(JINA_BASE + url, headers=self._headers(key, render),
+                                     timeout=self._timeout(render), follow_redirects=True)
+                cls = classify_provider_status(r.status_code)
+                if cls is ErrorClass.PROVIDER_ACCOUNT and provider_keys.bench(
+                    "jina", key, "rejected" if r.status_code == 401 else "empty"
+                ):
+                    continue            # another key can carry on
+                break
             if cls is None:
                 provider_keys.unbench(key)
-            elif cls is ErrorClass.PROVIDER_ACCOUNT and provider_keys.bench(
-                "jina", key, "rejected" if r.status_code == 401 else "empty"
-            ):
-                # This key is rejected or out of credit, but another one in the pool
-                # is not: retry with it. The job pauses only when every key is spent.
-                raise FetchError(
-                    ErrorClass.TRANSIENT, "homepage", "jina key benched", r.status_code,
-                    provider=False, retry_after=0.05,
-                )
             if cls is not None:
                 if cls is ErrorClass.TRANSIENT and r.status_code == 429:
                     # A 429 means WE are going too fast, not that Jina is unhealthy.
@@ -631,7 +701,8 @@ class JinaFetcher(_BaseFetcher):
                 via="jina_render" if render else "jina",
             )
 
-        return await self._attempt_with_retries(url, d, go)
+        # A rendered fetch is an optional extra and slow: one attempt.
+        return await self._attempt_with_retries(url, d, go, retries=not render)
 
     async def get_text(self, url: str, *, domain: str | None = None) -> FetchResult:
         return await self._text.get_text(url, domain=domain)
@@ -669,6 +740,11 @@ class HybridFetcher:
         self.gate = gate
         self.direct_gate = direct_gate or build_direct_gate()
         self._direct = HttpxFetcher(self.direct_gate)
+        self._direct.page_headers = {
+            "User-Agent": settings.direct_user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         self._jina = JinaFetcher(gate, self.direct_gate)
         self.stats = {"direct": 0, "jina": 0, "jina_render": 0}
 
@@ -678,7 +754,8 @@ class HybridFetcher:
 
     async def get_html(self, url: str, *, domain: str | None = None) -> FetchResult:
         try:
-            r = await self._direct.get_html(url, domain=domain)
+            # One direct attempt: Jina is the retry.
+            r = await self._direct.get_html(url, domain=domain, retry=False)
         except FetchError as e:
             if e.reason not in _FALLBACK_REASONS or e.status == 404:
                 raise
@@ -688,8 +765,10 @@ class HybridFetcher:
             log.info("hybrid_fallback", extra={"url": url, "why": "js_shell"})
             try:
                 return self._count(await self.render_html(url, domain=domain))
+            except CircuitOpen:
+                pass                # Jina is unwell; the page we have still counts
             except FetchError as e:
-                # Out of credit or the breaker is open: that must reach the worker.
+                # Every key spent must reach the worker, which pauses the job.
                 # Anything else, keep the page we do have.
                 if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
                     raise

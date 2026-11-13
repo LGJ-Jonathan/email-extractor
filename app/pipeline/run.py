@@ -329,12 +329,17 @@ async def _process(
             if html:
                 pages.append((url, score, html))
 
-    await _second_pass(domain, fetcher, scratch)
+    await _second_pass(domain, fetcher, scratch, started)
     judgment = await _judge_pages(domain, scratch)
     return _harvest(domain, scratch, judgment=judgment, started=started)
 
 
-async def _second_pass(domain: str, fetcher: Fetcher, scratch: Scratch) -> None:
+# The second pass is an extra: it may never cost a domain the result it already has.
+SECOND_PASS_BUDGET_S = 45.0
+
+
+async def _second_pass(domain: str, fetcher: Fetcher, scratch: Scratch,
+                       started: float) -> None:
     """No address on the pages as fetched: look again the way a browser sees them.
 
     Only with a fetcher that can render (FETCH_BACKEND=hybrid). A site that writes its
@@ -342,6 +347,11 @@ async def _second_pass(domain: str, fetcher: Fetcher, scratch: Scratch) -> None:
     in it, so "the fetch worked" says nothing about whether the address was there to
     find. The best pages first (homepage, then by discovery score), a few at most, and
     never one that was already rendered.
+
+    Rendered pages are ADDED to the pages in hand, never swapped in: the first copy
+    may hold the contact form and phone numbers this domain will be reported with.
+    Whatever goes wrong here (provider unwell, too slow) the first pass stands; only
+    "every key is spent" is raised, so the job pauses instead of quietly skipping.
     """
     render = getattr(fetcher, "render_html", None)
     if render is None or not settings.hybrid_second_pass:
@@ -349,36 +359,51 @@ async def _second_pass(domain: str, fetcher: Fetcher, scratch: Scratch) -> None:
     ranked, _p, _s, _f = await asyncio.to_thread(_extract_all, scratch)
     if ranked:
         return
+    left = settings.domain_timeout_s - (time.perf_counter() - started) - 15.0
+    budget = min(SECOND_PASS_BUDGET_S, left)
+    if budget < 5.0:
+        return
     order = sorted(range(len(scratch.pages)),
                    key=lambda i: (i != 0, -scratch.pages[i][1]))
-    todo = [i for i in order if scratch.via.get(scratch.pages[i][0]) != "jina_render"]
+    todo = [scratch.pages[i] for i in order
+            if scratch.via.get(scratch.pages[i][0]) != "jina_render"]
     todo = todo[: max(0, settings.hybrid_second_pass_pages)]
     if not todo:
         return
 
-    async def rerender(i: int):
-        url, score, _html = scratch.pages[i]
+    async def rerender(page):
+        url, score, _html = page
         try:
-            return i, await render(url, domain=domain)
+            return url, score, await render(url, domain=domain)
+        except CircuitOpen:
+            return url, score, None
         except FetchError as e:
             if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
                 raise
-            return i, None
+            return url, score, None
 
-    replaced = 0
-    for i, r in await asyncio.gather(*(rerender(i) for i in todo)):
+    tasks = [asyncio.ensure_future(rerender(p)) for p in todo]
+    try:
+        async with asyncio.timeout(budget) as scope:
+            await asyncio.gather(*tasks)
+    except TimeoutError:
+        if not scope.expired():
+            raise                    # the domain's own deadline, not ours
+    added = 0
+    for t in tasks:
+        if not t.done() or t.cancelled():
+            t.cancel()
+            continue
+        if t.exception() is not None:
+            raise t.exception()
+        url, score, r = t.result()
         if r is None or not r.html:
             continue
-        url, score, _old = scratch.pages[i]
-        scratch.pages[i] = (url, score, r.html)
+        scratch.pages.append((url, score, r.html))
         scratch.via[url] = r.via
         scratch.tokens += r.jina_tokens or 0
-        replaced += 1
-        if i == 0:
-            scratch.home_html = r.html
-    if replaced:
-        scratch.extracted = None          # same page count, different pages
-    log.info("second_pass", extra={"domain": domain, "pages": len(todo), "rendered": replaced})
+        added += 1
+    log.info("second_pass", extra={"domain": domain, "pages": len(todo), "rendered": added})
 
 
 def _extract_all(scratch: Scratch):
@@ -502,7 +527,7 @@ def _harvest(
         socials=socials,
         contact_form_url=contact_form_url,
         mx_provider=scratch.dns.mx_provider if scratch.dns else None,
-        pages_fetched=[u for u, _, _ in scratch.pages],
+        pages_fetched=list(dict.fromkeys(u for u, _, _ in scratch.pages)),
         jina_tokens=scratch.tokens,
         typesafe_called=judgment.typesafe_called,
         typesafe_error=judgment.typesafe_error,

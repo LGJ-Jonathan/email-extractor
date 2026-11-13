@@ -842,14 +842,13 @@ async def _store_provider_key(name: str, body: ProviderKeyBody, request: Request
         if provider != "jina":
             raise ApiError("single_key_provider",
                            f"{provider} takes one key; save it to replace the current one")
-        await provider_keys.refresh(session, force=True)
-        if len(provider_keys.entries(provider)) >= settings.jina_max_keys:
-            raise ApiError("key_pool_full",
-                           f"{provider} already has {settings.jina_max_keys} keys; remove one first")
 
     async with httpx.AsyncClient(timeout=providers.TIMEOUT_S) as client:
         if provider == "jina":
             balance = await providers.jina_balance(client, body.key)
+            if balance is None and providers.wallet_was_unreachable():
+                raise ApiError("invalid_provider_key", "Jina could not be reached to check "
+                               "this key; try again", status=503, retry_after=30)
             if balance is None:
                 raise ApiError("invalid_provider_key", "Jina did not accept this key")
             status = providers.jina_state(balance)
@@ -866,9 +865,13 @@ async def _store_provider_key(name: str, body: ProviderKeyBody, request: Request
     try:
         rid = getattr(request.state, "request_id", None)
         if add:
-            added = await provider_keys.add(session, provider, body.key, who.name, rid)
+            added = await provider_keys.add(session, provider, body.key, who.name, rid,
+                                            max_keys=settings.jina_max_keys)
         else:
             await provider_keys.save(session, provider, body.key, who.name, rid)
+    except provider_keys.PoolFull:
+        raise ApiError("key_pool_full", f"{provider} already has {settings.jina_max_keys} "
+                       "keys; remove one first") from None
     except provider_keys.KeyStoreUnavailable as e:
         raise ApiError("key_store_unavailable", str(e)) from e
     providers.reset_cache()
@@ -922,7 +925,6 @@ async def delete_one_provider_key(
     """Remove one key from the pool."""
     _require_admin(who)
     provider = _provider(name)
-    _limit_key_changes(who)
     from app import provider_keys, providers
 
     if not await provider_keys.remove(session, provider, str(key_id), who.name,
@@ -943,7 +945,8 @@ async def delete_provider_key(
     """Forget the portal-set key; the environment's key (if any) applies again."""
     _require_admin(who)
     provider = _provider(name)
-    _limit_key_changes(who)
+    # No limiter: removing a key checks nothing with a provider, and removals that
+    # used up the minute's budget blocked the paste of the keys replacing them.
     from app import provider_keys, providers
 
     await provider_keys.clear(session, provider, who.name,

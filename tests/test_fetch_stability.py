@@ -348,3 +348,199 @@ async def test_the_second_pass_can_be_switched_off(live_dns, monkeypatch):
     f = _Renderer(plain={"https://acme.com/": BIG}, rendered={})
     r = await run_mod.process_domain("acme.com", f)
     assert f.renders == [] and r.status != "found"
+
+
+# --- security review, 2026-11-13 -----------------------------------------------------
+
+
+async def test_the_address_guard_refuses_when_its_own_lookup_fails(monkeypatch):
+    async def boom(host, port):
+        raise OSError("resolver dropped the query")
+
+    monkeypatch.setattr(F.settings, "fetch_guard_private_addresses", True)
+    monkeypatch.setattr(F.netguard, "resolve_public", boom)
+    with pytest.raises(FetchError) as e:
+        await F.guard_url("https://acme.com/")
+    assert e.value.error_class is ErrorClass.TRANSIENT
+
+
+def test_a_response_from_a_private_address_is_refused_before_its_body_is_read(monkeypatch):
+    monkeypatch.setattr(F.settings, "fetch_guard_private_addresses", True)
+
+    class Stream:
+        def __init__(self, ip):
+            self.ip = ip
+
+        def get_extra_info(self, name):
+            return (self.ip, 443) if name == "server_addr" else None
+
+    def resp(ip):
+        return httpx.Response(200, request=httpx.Request("GET", "https://acme.com/"),
+                              extensions={"network_stream": Stream(ip)})
+
+    F._check_peer(resp("93.184.216.34"))
+    for ip in ("10.0.0.5", "127.0.0.1", "fd12::10", "169.254.169.254"):
+        with pytest.raises(FetchError) as e:
+            F._check_peer(resp(ip))
+        assert e.value.reason == "private_address"
+
+
+def test_a_compressed_body_is_inflated_to_the_page_cap_and_no_further():
+    import gzip
+    import zlib
+
+    bomb = gzip.compress(b"A" * 50_000_000)
+    assert len(bomb) < 100_000
+    assert len(F._inflate(bomb, "gzip", 2_000_000)) == 2_000_000
+    assert F._inflate(gzip.compress(b"<html>hi</html>"), "gzip", 1000) == b"<html>hi</html>"
+    assert F._inflate(zlib.compress(b"<p>x</p>"), "deflate", 1000) == b"<p>x</p>"
+    assert F._inflate(b"plain", "", 3) == b"pla"
+    for enc in ("gzip, gzip", "br", "zstd"):
+        with pytest.raises(FetchError):
+            F._inflate(bomb, enc, 1000)
+    with pytest.raises(FetchError):
+        F._inflate(b"not gzip at all", "gzip", 1000)
+
+
+@respx.mock
+async def test_a_gzipped_site_is_still_read(no_guard):
+    import gzip
+
+    respx.get("https://acme.com/").mock(return_value=httpx.Response(
+        200, content=gzip.compress(BIG.encode()),
+        headers={"content-type": "text/html", "content-encoding": "gzip"}))
+    r = await hybrid().get_html("https://acme.com/")
+    assert "Acme Roofing" in r.html
+
+
+def test_a_service_process_has_no_key_until_it_has_read_the_saved_ones(monkeypatch):
+    monkeypatch.setattr(pk.settings, "jina_api_key", "env_key_0000")
+    assert pk.current("jina") == "env_key_0000"          # a script: environment, as ever
+    pk.set_process_name("worker")
+    assert pk.current("jina") == "" and pk.source("jina") == "unreadable"
+    pk._loaded_at = 1.0                                   # the first read succeeded
+    assert pk.current("jina") == "env_key_0000"
+
+
+def test_private_address_failures_are_not_retried():
+    from app.queue import RETRYABLE_FAILURE_REASONS
+
+    assert "private_address" not in RETRYABLE_FAILURE_REASONS
+
+
+def test_tracebacks_are_redacted_too():
+    import logging
+
+    from app.logsetup import RedactingFormatter
+
+    try:
+        raise ValueError("Illegal header value b'Bearer jina_SUPERSECRETKEY1234567890'")
+    except ValueError:
+        import sys
+
+        rec = logging.LogRecord("x", logging.ERROR, __file__, 1, "request failed", None,
+                                sys.exc_info())
+    out = RedactingFormatter(None).format(rec)
+    assert "SUPERSECRET" not in out and "request failed" in out
+
+
+# --- correctness review, 2026-11-13 --------------------------------------------------
+
+
+@respx.mock
+async def test_dead_keys_do_not_use_up_the_retries_while_a_good_key_remains():
+    def answer(request):
+        if request.headers["authorization"] == "Bearer key_good":
+            return jina_ok()
+        return httpx.Response(402)
+
+    respx.get(url__startswith="https://r.jina.ai/").mock(side_effect=answer)
+    _pool("key_dead1", "key_dead2", "key_dead3", "key_dead4", "key_good")
+    r = await JinaFetcher(gate()).get_html("https://acme.com/")
+    assert "contact" in r.html          # reached the good key inside one attempt
+    assert "key_good" not in pk._benched
+
+
+@respx.mock
+async def test_an_open_jina_breaker_does_not_throw_away_a_page_fetched_directly(no_guard):
+    from app.ratelimit import CircuitOpen
+
+    respx.get("https://acme.com/").mock(return_value=httpx.Response(
+        200, text=SHELL, headers={"content-type": "text/html"}))
+    f = hybrid()
+
+    async def refused(url, *, domain=None):
+        raise CircuitOpen("jina", 30)
+
+    f.render_html = refused
+    r = await f.get_html("https://acme.com/")
+    assert r.via == "direct"
+
+
+async def test_the_second_pass_keeps_the_first_pass_and_survives_a_sick_provider(live_dns):
+    from app.ratelimit import CircuitOpen
+
+    form = BIG.replace("</body>", '<form action="/send"><input name="email"><textarea '
+                       'name="message"></textarea></form><a href="tel:+13055550123">Call</a></body>')
+
+    class Sick(_Renderer):
+        async def render_html(self, url, *, domain=None):
+            self.renders.append(url)
+            raise CircuitOpen("jina", 30)
+
+    sick = Sick(plain={"https://acme.com/": form}, rendered={})
+    r = await run_mod.process_domain("acme.com", sick)
+    assert r.error_reason is None and r.status != "fetch_failed" and sick.renders
+
+    # A render that shows less than the first copy must not cost the form or phones.
+    thin = _Renderer(plain={"https://acme.com/": form},
+                     rendered={"https://acme.com/": "<html><body><footer>Acme</footer></body></html>"})
+    r2 = await run_mod.process_domain("acme.com", thin)
+    assert (r2.status, r2.phones, r2.contact_form_url) == (r.status, r.phones, r.contact_form_url)
+    assert r2.pages_fetched == ["https://acme.com/"]
+
+
+@respx.mock
+async def test_a_rendered_fetch_reads_the_whole_page_once(no_guard):
+    seen = []
+
+    def jina(request):
+        seen.append("x-target-selector" in request.headers)
+        return httpx.Response(503)
+
+    respx.get(url__startswith="https://r.jina.ai/").mock(side_effect=jina)
+    with pytest.raises(FetchError):
+        await JinaFetcher(gate()).get_html("https://acme.com/", render=True)
+    assert seen == [False]                      # no region filter, and no retries
+
+
+def test_pool_credit_merges_only_a_named_account_with_the_same_balance():
+    import asyncio
+
+    from app import providers
+
+    async def run(wallets):
+        _pool(*wallets)
+
+        async def fake(client, key):
+            return wallets[key]
+
+        orig, providers.jina_wallet = providers.jina_wallet, fake
+        try:
+            return (await providers.jina_pool(None))["balance_tokens"]
+        finally:
+            providers.jina_wallet = orig
+
+    # same account, same balance: one wallet
+    assert asyncio.run(run({"k_aaaa": (300, "acct"), "k_bbbb": (300, "acct")})) == 300
+    # no account id: never merged (two new keys both start on the same free credit)
+    assert asyncio.run(run({"k_aaaa": (10, None), "k_bbbb": (10, None)})) == 20
+    # same account id, different balances: per-key wallets, both count
+    assert asyncio.run(run({"k_aaaa": (300, "acct"), "k_bbbb": (50, "acct")})) == 350
+
+
+def test_a_first_successful_key_read_counts_as_a_change_so_the_worker_retries():
+    pk.set_process_name("worker")
+    before = pk.signature("jina")
+    pk._loaded_at = 1.0
+    assert pk.signature("jina") != before

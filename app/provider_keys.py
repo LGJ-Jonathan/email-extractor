@@ -85,6 +85,16 @@ def decrypt(provider: str, ciphertext: str, nonce: str) -> str:
                            provider.encode()).decode()
 
 
+def _not_loaded_yet() -> bool:
+    """A service process (api, worker) that has not yet read the saved keys does not
+    know whether an admin replaced the environment's key, so it has NO key until it
+    does. Otherwise a failed first read (a database blip at boot, code started ahead
+    of its migration) left it crawling on the environment key indefinitely -- the
+    very key that gets replaced from the portal when it leaks. Scripts and tests
+    never name themselves and keep using the environment directly."""
+    return _process_name is not None and _loaded_at == 0.0
+
+
 def _env_key(provider: str) -> str:
     return settings.jina_api_key if provider == "jina" else settings.typesafe_api_key
 
@@ -117,7 +127,7 @@ def current(provider: str) -> str:
     else the environment's. Empty when a saved key exists but cannot be decrypted here
     (fail closed). When every saved key is benched, the one due back soonest is
     returned, so the provider's answer (still out of credit, or working again) is seen."""
-    if provider in _failed:
+    if provider in _failed or _not_loaded_yet():
         return ""
     saved = _keys.get(provider)
     if not saved:
@@ -150,11 +160,14 @@ def unbench(key: str) -> None:
 def signature(provider: str) -> tuple:
     """Changes when the provider's saved keys change. The worker compares it before
     pausing, to notice a key an admin saved moments ago."""
-    return tuple(e.id for e in _keys.get(provider, [])), provider in _failed
+    # "Not read yet" is part of it: a worker whose first read failed has no key, and
+    # must retry once the read succeeds rather than pause every job over a blip.
+    return (tuple(e.id for e in _keys.get(provider, [])), provider in _failed,
+            _not_loaded_yet())
 
 
 def source(provider: str) -> str:
-    if provider in _failed:
+    if provider in _failed or _not_loaded_yet():
         return "unreadable"
     if _keys.get(provider):
         return "portal"
@@ -330,16 +343,41 @@ async def save(session: AsyncSession, provider: str, secret: str, who: str,
     await refresh(session, force=True)
 
 
+class PoolFull(RuntimeError):
+    pass
+
+
 async def add(session: AsyncSession, provider: str, secret: str, who: str,
-              request_id: str | None = None) -> bool:
-    """Add a key to the provider's pool. False when it is already there."""
-    await refresh(session, force=True)
-    if provider in _failed:
-        # Cannot compare against a key we cannot read; adding beside it would leave
-        # the provider failed-closed anyway. Replace (PUT) is the way out.
-        raise KeyStoreUnavailable("a saved key cannot be decrypted; replace it instead")
-    if any(e.key == secret for e in _keys.get(provider, [])):
-        return False
+              request_id: str | None = None, max_keys: int | None = None) -> bool:
+    """Add a key to the provider's pool. False when it is already there.
+
+    The check and the insert run under one advisory lock per provider, and read the
+    table itself rather than this process's copy: two POSTs of the same key at once
+    (a double click, two API replicas) both passed a check-then-insert, and the key
+    then sat in the rotation twice, counted as two keys' worth of rate limit."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                          {"k": f"provider_keys:{provider}"})
+    rows = (await session.execute(
+        text("SELECT ciphertext, nonce FROM provider_keys WHERE provider = :p"),
+        {"p": provider},
+    )).all()
+    for r in rows:
+        try:
+            if decrypt(provider, r.ciphertext, r.nonce) == secret:
+                await session.rollback()
+                return False
+        except KeyStoreUnavailable:
+            await session.rollback()
+            raise
+        except Exception as e:  # noqa: BLE001 - wrong master key or tampered row
+            # Cannot compare against a key we cannot read; adding beside it would
+            # leave the provider failed-closed anyway. Replacing (PUT) is the way out.
+            await session.rollback()
+            raise KeyStoreUnavailable(
+                "a saved key cannot be decrypted; replace it instead") from e
+    if max_keys is not None and len(rows) >= max_keys:
+        await session.rollback()
+        raise PoolFull(provider)
     await _insert(session, provider, secret, who)
     await audit(session, provider, "added", secret[-4:], who, request_id)
     await session.commit()

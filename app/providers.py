@@ -27,6 +27,11 @@ TIMEOUT_S = 6.0
 JINA_WALLET_URL = "https://embeddings-dashboard-api.jina.ai/api/v1/api_key/user"
 TYPESAFE_MODELS_URL = "https://api.typesafe.ai/v1/models"
 
+import contextvars
+
+_wallet_unreachable: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "wallet_unreachable", default=False)
+
 _cache: tuple[float, dict] | None = None
 _lock = asyncio.Lock()
 
@@ -44,8 +49,11 @@ async def jina_wallet(client: httpx.AsyncClient, key: str) -> tuple[int | None, 
     is None if it can't be read. The account id only ever serves to notice two keys
     drawing on one wallet, so their credit is not counted twice; it is hashed here and
     never leaves the service."""
+    _wallet_unreachable.set(False)
     try:
         r = await client.get(JINA_WALLET_URL, params={"api_key": key})
+        if r.status_code == 429 or r.status_code >= 500:
+            _wallet_unreachable.set(True)      # Jina's trouble, not the key's
         payload = (r.json() or {}) if r.status_code == 200 else {}
         wallet = payload.get("wallet") or {}
         total = wallet.get("total_balance")
@@ -57,8 +65,18 @@ async def jina_wallet(client: httpx.AsyncClient, key: str) -> tuple[int | None, 
 
             account = hashlib.sha256(account.encode()).hexdigest()[:16]
         return balance, account
-    except (httpx.HTTPError, ValueError, TypeError):
+    except httpx.HTTPError:
+        _wallet_unreachable.set(True)
         return None, None
+    except (ValueError, TypeError):
+        return None, None
+
+
+def wallet_was_unreachable() -> bool:
+    """Whether the last wallet lookup in this task failed because Jina could not be
+    reached (timeout, 429, 5xx) rather than because it refused the key. Saving a key
+    must say "try again", not "rejected", during a Jina dashboard outage."""
+    return _wallet_unreachable.get()
 
 
 async def jina_balance(client: httpx.AsyncClient, key: str) -> int | None:
@@ -68,8 +86,9 @@ async def jina_balance(client: httpx.AsyncClient, key: str) -> int | None:
 
 async def jina_pool(client: httpx.AsyncClient) -> dict:
     """Balance per saved key, and the credit across the pool with each wallet counted
-    once. Two keys reporting the very same balance at the same moment are taken to
-    share a wallet when Jina gives no account id."""
+    once. Two keys are one wallet only when Jina names the same account AND reports
+    the same balance for both; without an account id nothing is merged (two new keys
+    both start with the same free credit, and they are not the same wallet)."""
     from app import provider_keys
 
     saved = provider_keys.entries("jina")
@@ -81,10 +100,10 @@ async def jina_pool(client: httpx.AsyncClient) -> dict:
         per_key.append({"id": e.id, "balance_tokens": balance, "status": jina_state(balance)})
         if balance is None:
             continue
-        wallet_id = account or f"balance:{balance}"
-        if wallet_id in seen:
-            continue
-        seen.add(wallet_id)
+        if account is not None:
+            if (account, balance) in seen:
+                continue
+            seen.add((account, balance))
         total = (total or 0) + balance
     return {"balance_tokens": total, "keys": per_key}
 

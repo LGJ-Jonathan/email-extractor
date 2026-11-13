@@ -292,7 +292,7 @@ async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
 # parked, blocked, not_html, ...). Re-running exactly these by hand after the 16k run
 # lifted its found rate from 44% to 55%.
 RETRYABLE_FAILURE_REASONS = ("homepage", "dns", "dns_timeout", "circuit_open", "domain_timeout",
-                             "internal_error", "private_address")
+                             "internal_error")
 
 
 async def requeue_failed(session: AsyncSession, job_id: uuid.UUID) -> int:

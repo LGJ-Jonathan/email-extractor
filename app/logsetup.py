@@ -31,6 +31,19 @@ class RedactSecrets(logging.Filter):
         return True
 
 
+class RedactingFormatter(logging.Formatter):
+    """Redacts the FINAL line, traceback included. The filter above only sees the
+    message, and an exception's text (h11's "Illegal header value b'Bearer ...'")
+    is printed after it."""
+
+    def __init__(self, inner: logging.Formatter | None) -> None:
+        super().__init__()
+        self._inner = inner or logging.Formatter(logging.BASIC_FORMAT)
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(self._inner.format(record))
+
+
 def configure(level: str) -> None:
     logging.basicConfig(level=level)
     for noisy in ("httpx", "httpcore"):
@@ -38,3 +51,5 @@ def configure(level: str) -> None:
     for handler in logging.getLogger().handlers:
         if not any(isinstance(f, RedactSecrets) for f in handler.filters):
             handler.addFilter(RedactSecrets())
+        if not isinstance(handler.formatter, RedactingFormatter):
+            handler.setFormatter(RedactingFormatter(handler.formatter))
