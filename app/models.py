@@ -246,11 +246,15 @@ class Page(Base):
 
 
 class ProviderKey(Base):
-    """Jina / TypeSafe keys set from the portal; AES-GCM ciphertext (app/provider_keys.py)."""
+    """Jina / TypeSafe keys set from the portal; AES-GCM ciphertext (app/provider_keys.py).
+    A provider may have several (the Jina pool); requests rotate across them."""
 
     __tablename__ = "provider_keys"
 
-    provider: Mapped[str] = mapped_column(Text, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
     ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     nonce: Mapped[str] = mapped_column(Text, nullable=False)
     last4: Mapped[str] = mapped_column(Text, nullable=False)
@@ -258,6 +262,8 @@ class ProviderKey(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    __table_args__ = (Index("ix_provider_keys_provider", "provider", "updated_at"),)
 
 
 class ProviderKeyAudit(Base):

@@ -1433,3 +1433,89 @@ async def test_worker_health_is_written_on_heartbeat_and_read_by_status(db, monk
         await s.execute(text("DELETE FROM process_status"))
         await s.commit()
         assert (await worker_health(s))["status"] == "never_seen"
+
+
+async def test_a_jina_key_pool_adds_dedupes_removes_and_counts_each_wallet_once(
+        db, monkeypatch, api_key):
+    import httpx
+
+    from app import main as main_mod
+    from app import provider_keys, providers
+    from app.main import app
+
+    _new_master(monkeypatch)
+    main_mod._key_changes.clear()
+    provider_keys.reset_for_tests()
+
+    wallets = {"jina_pool_key_aaaa": (300_000_000, "acct1"),
+               "jina_pool_key_bbbb": (300_000_000, "acct1"),      # same account as aaaa
+               "jina_pool_key_cccc": (50_000_000, "acct2")}
+
+    async def fake_wallet(client, key):
+        return wallets.get(key, (None, None))
+
+    monkeypatch.setattr(providers, "jina_wallet", fake_wallet)
+    h = {"X-API-Key": api_key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for key in wallets:
+            r = await c.post("/providers/keys/jina", json={"key": key}, headers=h)
+            assert r.status_code == 200, r.text
+            assert key not in r.text
+        r = await c.post("/providers/keys/jina", json={"key": "jina_pool_key_aaaa"}, headers=h)
+        assert r.json()["already_saved"] is True and r.json()["keys"] == 3
+        r = await c.post("/providers/keys/jina", json={"key": "jina_unknown_key_zzzz"}, headers=h)
+        assert r.status_code == 422
+        r = await c.post("/providers/keys/typesafe", json={"key": "ts_some_key_12345"}, headers=h)
+        assert r.status_code == 409 and r.json()["error"]["code"] == "single_key_provider"
+
+        body = (await c.get("/providers/keys", headers=h)).json()
+        pool = body["pool"]["jina"]
+        assert [k["last4"] for k in pool] == ["aaaa", "bbbb", "cccc"]
+        assert all(k["state"] == "in_use" for k in pool)
+        assert pool[2]["balance_tokens"] == 50_000_000
+        assert not any(k in json.dumps(body) for k in wallets)
+
+        providers.reset_cache()
+        status = (await c.get("/providers/status", headers=h)).json()
+        assert status["jina"]["keys"] == 3
+        assert status["jina"]["balance_tokens"] == 350_000_000      # acct1 counted once
+
+        # Requests rotate across the pool; a benched key drops out and comes back.
+        seen = {provider_keys.current("jina") for _ in range(6)}
+        assert seen == set(wallets)
+        assert provider_keys.usable_count("jina") == 3
+        assert provider_keys.bench("jina", "jina_pool_key_aaaa", "empty") is True
+        assert provider_keys.usable_count("jina") == 2
+        assert "jina_pool_key_aaaa" not in {provider_keys.current("jina") for _ in range(6)}
+        provider_keys.unbench("jina_pool_key_aaaa")
+        assert provider_keys.usable_count("jina") == 3
+
+        r = await c.delete(f"/providers/keys/jina/{pool[0]['id']}", headers=h)
+        assert r.status_code == 200
+        r = await c.delete(f"/providers/keys/jina/{pool[0]['id']}", headers=h)
+        assert r.status_code == 404 and r.json()["error"]["code"] == "key_not_found"
+        assert len((await c.get("/providers/keys", headers=h)).json()["pool"]["jina"]) == 2
+
+        # PUT still means "this key only".
+        r = await c.put("/providers/keys/jina", json={"key": "jina_pool_key_cccc"}, headers=h)
+        assert r.status_code == 200 and r.json()["keys"] == 1
+    provider_keys.reset_for_tests()
+
+
+def test_the_last_usable_key_is_not_rotated_away_and_env_keys_are_never_benched(monkeypatch):
+    from app import provider_keys as pk
+    from app.settings import settings
+
+    pk.reset_for_tests()
+    monkeypatch.setattr(settings, "jina_api_key", "env_key_0000")
+    assert pk.bench("jina", "env_key_0000", "empty") is False     # nothing to rotate to
+    assert pk.current("jina") == "env_key_0000"
+
+    pk._keys["jina"] = [pk.Entry("1", "k_one", "_one", None, None),
+                        pk.Entry("2", "k_two", "_two", None, None)]
+    assert pk.bench("jina", "k_one", "empty") is True
+    assert pk.bench("jina", "k_two", "rejected") is False         # every key spent: pause
+    assert pk.current("jina") == "k_one"                          # due back soonest
+    assert pk.usable_count("jina") == 1                           # the rate never hits zero
+    assert pk.benched_report() == {"1": "empty", "2": "rejected"}
+    pk.reset_for_tests()

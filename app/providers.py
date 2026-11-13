@@ -39,15 +39,54 @@ def jina_state(balance: int | None) -> str:
     return "low" if balance < settings.jina_low_balance_tokens else "ok"
 
 
-async def jina_balance(client: httpx.AsyncClient, key: str) -> int | None:
-    """The wallet's total balance for this key, or None if it can't be read."""
+async def jina_wallet(client: httpx.AsyncClient, key: str) -> tuple[int | None, str | None]:
+    """(total balance, an opaque id for the wallet's account) for this key; the balance
+    is None if it can't be read. The account id only ever serves to notice two keys
+    drawing on one wallet, so their credit is not counted twice; it is hashed here and
+    never leaves the service."""
     try:
         r = await client.get(JINA_WALLET_URL, params={"api_key": key})
-        wallet = (r.json() or {}).get("wallet") or {} if r.status_code == 200 else {}
+        payload = (r.json() or {}) if r.status_code == 200 else {}
+        wallet = payload.get("wallet") or {}
         total = wallet.get("total_balance")
-        return int(total) if isinstance(total, (int, float)) else None
+        balance = int(total) if isinstance(total, (int, float)) else None
+        account = next((str(payload[f]) for f in ("user_id", "_id", "id", "email")
+                        if payload.get(f)), None)
+        if account is not None:
+            import hashlib
+
+            account = hashlib.sha256(account.encode()).hexdigest()[:16]
+        return balance, account
     except (httpx.HTTPError, ValueError, TypeError):
-        return None
+        return None, None
+
+
+async def jina_balance(client: httpx.AsyncClient, key: str) -> int | None:
+    """The wallet's total balance for this key, or None if it can't be read."""
+    return (await jina_wallet(client, key))[0]
+
+
+async def jina_pool(client: httpx.AsyncClient) -> dict:
+    """Balance per saved key, and the credit across the pool with each wallet counted
+    once. Two keys reporting the very same balance at the same moment are taken to
+    share a wallet when Jina gives no account id."""
+    from app import provider_keys
+
+    saved = provider_keys.entries("jina")
+    wallets = await asyncio.gather(*(jina_wallet(client, e.key) for e in saved))
+    seen: set = set()
+    total: int | None = None
+    per_key = []
+    for e, (balance, account) in zip(saved, wallets):
+        per_key.append({"id": e.id, "balance_tokens": balance, "status": jina_state(balance)})
+        if balance is None:
+            continue
+        wallet_id = account or f"balance:{balance}"
+        if wallet_id in seen:
+            continue
+        seen.add(wallet_id)
+        total = (total or 0) + balance
+    return {"balance_tokens": total, "keys": per_key}
 
 
 async def typesafe_key_status(client: httpx.AsyncClient, key: str) -> str:
@@ -59,11 +98,18 @@ async def typesafe_key_status(client: httpx.AsyncClient, key: str) -> str:
 
 
 async def _jina(client: httpx.AsyncClient) -> dict:
+    from app import provider_keys
+
+    n = len(provider_keys.entries("jina"))
+    if n > 1:
+        pool = await jina_pool(client)
+        return {"status": jina_state(pool["balance_tokens"]),
+                "balance_tokens": pool["balance_tokens"], "keys": n}
     key = current_key("jina")
     if not key:
-        return {"status": "not_configured", "balance_tokens": None}
+        return {"status": "not_configured", "balance_tokens": None, "keys": 0}
     balance = await jina_balance(client, key)
-    return {"status": jina_state(balance), "balance_tokens": balance}
+    return {"status": jina_state(balance), "balance_tokens": balance, "keys": 1}
 
 
 async def _typesafe(client: httpx.AsyncClient) -> dict:
@@ -121,7 +167,8 @@ async def worker_health(session: AsyncSession) -> dict:
     return {
         "status": "ok" if age < WORKER_SILENT_S else "silent",
         "last_seen_s": age,
-        **{k: health.get(k) for k in ("in_flight", "concurrency", "last_claim_at", "breaker")},
+        **{k: health.get(k) for k in ("in_flight", "concurrency", "last_claim_at", "breaker",
+                                      "provider_keys")},
     }
 
 

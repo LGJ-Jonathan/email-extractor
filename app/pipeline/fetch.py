@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from app import netguard
 from app.pipeline.htmlscan import Block, looks_emailish, strip_blocks
 from app.ratelimit import CircuitOpen, FetchGate, jittered
-from app.provider_keys import current as current_key
+from app import provider_keys
 from app.settings import settings
 
 log = logging.getLogger("email_extractor.fetch")
@@ -93,6 +93,9 @@ class FetchResult(BaseModel):
     html: str
     bytes: int
     jina_tokens: int | None = None
+    # How the page was obtained: direct (our own fetch), jina (Jina's plain fetch),
+    # jina_render (Jina's headless browser, JavaScript executed).
+    via: str = "direct"
 
 
 class Fetcher(Protocol):
@@ -215,7 +218,15 @@ def decode_body(raw: bytes, response: httpx.Response) -> str:
 # Jina. A ReadTimeout after a successful connect is the target rendering slowly, and
 # counting those as provider failures is what opened the breaker on 3,095 domains in
 # the 16k run; none of them were Jina's fault and the retry pass found 54% of them.
-PROVIDER_HEALTH_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+#
+# PoolTimeout is NOT here. It means OUR connection pool was full, which says nothing
+# about Jina. It used to count, and the Jina and direct fetches shared one 50-connection
+# pool: robots.txt and sitemap fetches to slow business sites held every connection,
+# the Jina calls waited 3 s for one and gave up, and each give-up was booked as Jina
+# being down. On the 18k Miami run that opened the breaker 627 times (every trip's
+# reasons read {"PoolTimeout": 5}), cut throughput to ~230 domains an hour and wrote
+# off 1,760 domains as circuit_open without one request reaching Jina.
+PROVIDER_HEALTH_EXC = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
 def _exc_to_fetch_error(exc: Exception, *, provider: bool = False) -> FetchError:
@@ -230,6 +241,9 @@ def _exc_to_fetch_error(exc: Exception, *, provider: bool = False) -> FetchError
         return FetchError(ErrorClass.PERMANENT, "redirect_loop", type(exc).__name__)
     if isinstance(exc, httpx.ConnectError) and "certificate" in str(exc).lower():
         return FetchError(ErrorClass.PERMANENT, "ssl_error", str(exc)[:120])
+    if isinstance(exc, httpx.PoolTimeout):
+        # Our own pool was full: retry, and never blame the provider for it.
+        return FetchError(ErrorClass.TRANSIENT, "homepage", "PoolTimeout", provider=False)
     if isinstance(exc, (httpx.TimeoutException, httpx.HTTPError)):
         return FetchError(
             ErrorClass.TRANSIENT,
@@ -275,35 +289,68 @@ async def guard_url(url: str) -> None:
 
 # --- shared client (spec 16: one per worker process, keep-alive) ----------
 
+# Two clients, two pools. Direct fetches go to thousands of business sites, many slow
+# or dead; provider fetches all go to one host. Sharing a pool let the first starve
+# the second (see PROVIDER_HEALTH_EXC).
 _client: httpx.AsyncClient | None = None
+_provider_client: httpx.AsyncClient | None = None
+
+# Waiting for a free connection is queueing, not failure: the gate's semaphore already
+# bounds how many requests are in flight, so a wait here is short and must not error.
+POOL_WAIT_S = 30.0
+
+
+def _new_client(*, max_connections: int, keepalive: int) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        http2=False,
+        follow_redirects=False,      # _raw_get follows by hand, guarding each hop
+        timeout=httpx.Timeout(
+            connect=settings.connect_timeout_s,
+            read=settings.read_timeout_s,
+            write=settings.read_timeout_s,
+            pool=POOL_WAIT_S,
+        ),
+        limits=httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=keepalive,
+        ),
+        headers={"User-Agent": settings.user_agent},
+    )
 
 
 def get_client() -> httpx.AsyncClient:
+    """Direct fetches to business sites (robots.txt, sitemaps, the httpx backend)."""
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            http2=False,
-            follow_redirects=False,      # _raw_get follows by hand, guarding each hop
-            timeout=httpx.Timeout(
-                connect=settings.connect_timeout_s,
-                read=settings.read_timeout_s,
-                write=settings.read_timeout_s,
-                pool=settings.connect_timeout_s,
-            ),
-            limits=httpx.Limits(
-                max_connections=settings.global_fetch_concurrency,
-                max_keepalive_connections=100,
-            ),
-            headers={"User-Agent": settings.user_agent},
-        )
+        # Headroom over the gate's concurrency: a connection being torn down still
+        # counts against the pool for a moment after its slot is released.
+        n = settings.global_fetch_concurrency
+        _client = _new_client(max_connections=n + max(10, n // 5), keepalive=20)
+        if settings.fetch_backend == "hybrid":
+            _client.headers.update({
+                "User-Agent": settings.direct_user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
     return _client
 
 
+def get_provider_client() -> httpx.AsyncClient:
+    """Calls to the fetch provider (r.jina.ai): one host, so keep-alive pays."""
+    global _provider_client
+    if _provider_client is None or _provider_client.is_closed:
+        n = settings.global_fetch_concurrency
+        _provider_client = _new_client(max_connections=n + max(10, n // 5), keepalive=n)
+    return _provider_client
+
+
 async def close_client() -> None:
-    global _client
-    if _client is not None and not _client.is_closed:
-        await _client.aclose()
+    global _client, _provider_client
+    for c in (_client, _provider_client):
+        if c is not None and not c.is_closed:
+            await c.aclose()
     _client = None
+    _provider_client = None
 
 
 # --- base -----------------------------------------------------------------
@@ -441,27 +488,33 @@ class JinaFetcher(_BaseFetcher):
         super().__init__(gate)
         self._text = HttpxFetcher(direct_gate or build_direct_gate())
 
-    def _timeout(self) -> httpx.Timeout:
+    def _timeout(self, render: bool = False) -> httpx.Timeout:
         """Per-request, so direct target fetches keep the tight shared-client budget."""
-        outer = settings.jina_timeout_s + self.CLIENT_MARGIN_S
+        inner = settings.jina_render_timeout_s if render else settings.jina_timeout_s
+        outer = inner + self.CLIENT_MARGIN_S
         return httpx.Timeout(
             connect=settings.connect_timeout_s,
             read=outer,
             write=outer,
-            pool=settings.connect_timeout_s,
+            pool=POOL_WAIT_S,
         )
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, key: str, render: bool = False) -> dict[str, str]:
+        # Plain fetch by default. A rendered fetch runs the page in Jina's headless
+        # browser, which is Jina's default engine: the header is left out unless
+        # JINA_RENDER_ENGINE names one.
+        engine = settings.jina_render_engine if render else "direct"
+        timeout_s = settings.jina_render_timeout_s if render else settings.jina_timeout_s
         return {
-            "Authorization": f"Bearer {current_key('jina')}",
+            **({"X-Engine": engine} if engine else {}),
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "X-Engine": "direct",
             "X-Respond-With": "html",
             "X-Retain-Images": "none",
             # X-Timeout is Jina's own deadline and must expire FIRST, so that a slow
             # target comes back as Jina's classified error rather than our timeout.
             # settings.read_timeout_s belongs to direct site fetches, not to this one.
-            "X-Timeout": str(settings.jina_timeout_s),
+            "X-Timeout": str(timeout_s),
             # DEVIATION 2: the spec's script:not(...) clause strips JSON-LD too.
             "X-Remove-Selector": (
                 "style, svg, img, iframe, noscript, link, meta, "
@@ -485,14 +538,28 @@ class JinaFetcher(_BaseFetcher):
             "X-Token-Budget": str(settings.max_page_tokens),
         }
 
-    async def get_html(self, url: str, *, domain: str | None = None) -> FetchResult:
+    async def get_html(self, url: str, *, domain: str | None = None,
+                       render: bool = False) -> FetchResult:
         d = domain or host_of(url)
 
         async def go() -> FetchResult:
-            client = get_client()
-            r = await client.get(JINA_BASE + url, headers=self._headers(), timeout=self._timeout(),
-                                 follow_redirects=True)
+            client = get_provider_client()
+            # One key per request, in rotation across the pool.
+            key = provider_keys.current("jina")
+            r = await client.get(JINA_BASE + url, headers=self._headers(key, render),
+                                 timeout=self._timeout(render), follow_redirects=True)
             cls = classify_provider_status(r.status_code)
+            if cls is None:
+                provider_keys.unbench(key)
+            elif cls is ErrorClass.PROVIDER_ACCOUNT and provider_keys.bench(
+                "jina", key, "rejected" if r.status_code == 401 else "empty"
+            ):
+                # This key is rejected or out of credit, but another one in the pool
+                # is not: retry with it. The job pauses only when every key is spent.
+                raise FetchError(
+                    ErrorClass.TRANSIENT, "homepage", "jina key benched", r.status_code,
+                    provider=False, retry_after=0.05,
+                )
             if cls is not None:
                 if cls is ErrorClass.TRANSIENT and r.status_code == 429:
                     # A 429 means WE are going too fast, not that Jina is unhealthy.
@@ -561,12 +628,79 @@ class JinaFetcher(_BaseFetcher):
                 html=strip_non_jsonld_scripts(html)[: settings.max_page_bytes],
                 bytes=len(html),
                 jina_tokens=usage.get("tokens"),
+                via="jina_render" if render else "jina",
             )
 
         return await self._attempt_with_retries(url, d, go)
 
     async def get_text(self, url: str, *, domain: str | None = None) -> FetchResult:
         return await self._text.get_text(url, domain=domain)
+
+
+# --- hybrid backend -------------------------------------------------------
+
+
+# Direct failures Jina may still get past: it fetches from another network, so a site
+# that refuses or stalls on our address can answer it. Everything else (a 404, a PDF,
+# a private address, a redirect loop) is the site's own answer and is the same there.
+_FALLBACK_REASONS = frozenset({"blocked", "homepage", "ssl_error"})
+
+
+def _is_shell(html: str) -> bool:
+    """A page that shows almost no text: the content is drawn by JavaScript."""
+    from app.pipeline.parked import visible_text
+
+    return len(visible_text(html)) < settings.hybrid_thin_text_chars
+
+
+class HybridFetcher:
+    """Our own fetch first, Jina for what it could not get.
+
+    Most business sites serve plain HTML to anyone, so paying a provider (and queueing
+    for its rate limit) to fetch them buys nothing. Jina is kept for the two things a
+    plain fetch from here cannot do: reach a site that refuses our address, and run a
+    page's JavaScript.
+
+    `gate` is the Jina gate, so the worker's breaker and health reporting see the
+    provider exactly as they do with FETCH_BACKEND=jina.
+    """
+
+    def __init__(self, gate: FetchGate, direct_gate: FetchGate | None = None) -> None:
+        self.gate = gate
+        self.direct_gate = direct_gate or build_direct_gate()
+        self._direct = HttpxFetcher(self.direct_gate)
+        self._jina = JinaFetcher(gate, self.direct_gate)
+        self.stats = {"direct": 0, "jina": 0, "jina_render": 0}
+
+    def _count(self, r: FetchResult) -> FetchResult:
+        self.stats[r.via] = self.stats.get(r.via, 0) + 1
+        return r
+
+    async def get_html(self, url: str, *, domain: str | None = None) -> FetchResult:
+        try:
+            r = await self._direct.get_html(url, domain=domain)
+        except FetchError as e:
+            if e.reason not in _FALLBACK_REASONS or e.status == 404:
+                raise
+            log.info("hybrid_fallback", extra={"url": url, "why": e.reason, "detail": e.detail})
+            return self._count(await self._jina.get_html(url, domain=domain))
+        if _is_shell(r.html):
+            log.info("hybrid_fallback", extra={"url": url, "why": "js_shell"})
+            try:
+                return self._count(await self.render_html(url, domain=domain))
+            except FetchError as e:
+                # Out of credit or the breaker is open: that must reach the worker.
+                # Anything else, keep the page we do have.
+                if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
+                    raise
+        return self._count(r)
+
+    async def render_html(self, url: str, *, domain: str | None = None) -> FetchResult:
+        """The page as a browser shows it (Jina's headless browser)."""
+        return await self._jina.get_html(url, domain=domain, render=True)
+
+    async def get_text(self, url: str, *, domain: str | None = None) -> FetchResult:
+        return await self._direct.get_text(url, domain=domain)
 
 
 # --- factory --------------------------------------------------------------
@@ -586,17 +720,25 @@ def build_direct_gate() -> FetchGate:
 
 
 def build_gate() -> FetchGate:
-    rpm = settings.jina_rpm if settings.fetch_backend == "jina" else None
+    rpm = settings.jina_rpm if settings.fetch_backend in ("jina", "hybrid") else None
     bucket = None
+    # JINA_RPM is per key, so the budget follows the number of usable keys.
+    scale = (lambda: float(provider_keys.usable_count("jina"))) if (
+        rpm and settings.jina_rpm_per_key) else None
     if rpm and settings.rate_limit_backend == "redis":
         from app.ratelimit import RedisTokenBucket
 
-        bucket = RedisTokenBucket(settings.redis_url, rpm, name=settings.fetch_backend)
+        bucket = RedisTokenBucket(settings.redis_url, rpm, name="jina",
+                                  scale=scale)
+    elif rpm:
+        from app.ratelimit import TokenBucket
+
+        bucket = TokenBucket(rpm, scale=scale)
     return FetchGate(
         rate_per_minute=rpm,
         global_concurrency=settings.global_fetch_concurrency,
         per_domain_concurrency=settings.per_domain_concurrency,
-        provider=settings.fetch_backend,
+        provider="jina" if rpm else settings.fetch_backend,
         bucket=bucket,
     )
 
@@ -605,4 +747,6 @@ def build_fetcher(gate: FetchGate | None = None) -> Fetcher:
     gate = gate or build_gate()
     if settings.fetch_backend == "jina":
         return JinaFetcher(gate)
+    if settings.fetch_backend == "hybrid":
+        return HybridFetcher(gate)
     return HttpxFetcher(gate)

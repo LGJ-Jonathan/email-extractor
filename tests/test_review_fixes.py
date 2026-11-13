@@ -305,7 +305,7 @@ async def test_provider_status_returns_only_balances(monkeypatch):
             return R()
 
     out = await providers.provider_status(FakeSession())
-    assert out["jina"] == {"status": "empty", "balance_tokens": -3322350}
+    assert out["jina"] == {"status": "empty", "balance_tokens": -3322350, "keys": 1}
     assert out["typesafe"] == {"status": "ok"}
     assert out["usage_this_month"] == {"jina_tokens": 5, "typesafe_calls": 2, "domains_fetched": 3}
     flat = json.dumps(out)

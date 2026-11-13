@@ -35,6 +35,12 @@ ERROR_RETRY_DELAY_S = 30.0
 MAX_CLAIMS = settings.max_domain_attempts + 2
 
 
+def provider_keys_in_use() -> int:
+    from app import provider_keys
+
+    return provider_keys.usable_count("jina") if settings.fetch_backend != "httpx" else 0
+
+
 class Worker:
     def __init__(self, concurrency: int | None = None, fetcher=None) -> None:
         self.id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
@@ -160,6 +166,7 @@ class Worker:
             "worker": self.id,
             "concurrency": self.concurrency,
             "in_flight": len(self._live),
+            "provider_keys": provider_keys_in_use(),
             "last_claim_at": (datetime.fromtimestamp(self._last_claim_at, UTC).isoformat()
                               if self._last_claim_at else None),
         }
@@ -232,7 +239,7 @@ class Worker:
 
         from app import provider_keys
 
-        key_before = provider_keys.current("jina")
+        keys_before = provider_keys.signature("jina")
         try:
             result = await process_domain(c.domain, self.fetcher)
         except FetchError as e:
@@ -243,11 +250,13 @@ class Worker:
             # reload first and, if the key changed, simply retry this domain with it.
             async with self.sessions() as s:
                 await provider_keys.refresh(s, force=True)
-                if provider_keys.current("jina") != key_before:
+                if provider_keys.signature("jina") != keys_before:
                     await queue.unlock_domain(s, c)
                     await queue.requeue(s, c, 0, count_attempt=False)
                     return
-            reason = f"{settings.fetch_backend}_account"
+            # hybrid's provider is Jina too; the portal knows "jina_account".
+            reason = ("jina_account" if settings.fetch_backend == "hybrid"
+                      else f"{settings.fetch_backend}_account")
             log.error("jobs_paused", extra={"reason": reason, "detail": str(e)})
             async with self.sessions() as s:
                 await queue.pause_active_jobs(s, reason)

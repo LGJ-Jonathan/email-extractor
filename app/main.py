@@ -186,7 +186,7 @@ async def extract(req: ExtractRequest) -> DomainResult:
         # Was a bare 500. It is the provider account (quota, key), not this request.
         raise ApiError(
             "provider_quota_exhausted",
-            f"the {settings.fetch_backend} account is out of credit or rejecting our key; "
+            f"the {'jina' if settings.fetch_backend == 'hybrid' else settings.fetch_backend} account is out of credit or rejecting our key; "
             "lookups resume once it is topped up",
         ) from e
 
@@ -801,28 +801,51 @@ async def get_provider_keys(
     from app import provider_keys
 
     await provider_keys.refresh(session, force=True)
+    from app import providers
+
+    processes = await provider_keys.processes(session)
+    # The worker makes the provider calls, so its view of a benched key is the one
+    # that matters; this process's own is added for single-domain lookups.
+    benched = {**provider_keys.benched_report(),
+               **((processes.get("worker") or {}).get("benched") or {})}
+    balances: dict[str, dict] = {}
+    if provider_keys.entries("jina"):
+        async with httpx.AsyncClient(timeout=providers.TIMEOUT_S) as client:
+            balances = {k["id"]: k for k in (await providers.jina_pool(client))["keys"]}
+    pool = {
+        p: [{"id": e.id, "last4": e.last4, "added_by": e.updated_by, "added_at": e.updated_at,
+             "state": benched.get(e.id, "in_use"),
+             "balance_tokens": balances.get(e.id, {}).get("balance_tokens"),
+             "balance_status": balances.get(e.id, {}).get("status")}
+            for e in provider_keys.entries(p)]
+        for p in provider_keys.PROVIDERS
+    }
     return {"keys": provider_keys.describe(),
+            "pool": pool,
+            "max_keys": {"jina": settings.jina_max_keys, "typesafe": 1},
+            "rpm_per_key": settings.jina_rpm if settings.jina_rpm_per_key else None,
             "can_save": bool(settings.provider_key_encryption_key),
             # What each process is really using: a worker that cannot decrypt a saved
             # key shows here as "unreadable" instead of silently using another key.
-            "processes": await provider_keys.processes(session),
+            "processes": processes,
             "audit": await provider_keys.recent_audit(session)}
 
 
-@app.put("/providers/keys/{name}")
-async def put_provider_key(
-    name: str,
-    body: ProviderKeyBody,
-    request: Request,
-    who: Principal = Depends(require_api_key),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Check the key with the provider, then save it encrypted. A Jina key with enough
-    credit also resumes the jobs that paused because Jina ran out."""
+async def _store_provider_key(name: str, body: ProviderKeyBody, request: Request,
+                              who: Principal, session: AsyncSession, *, add: bool) -> dict:
     _require_admin(who)
     provider = _provider(name)
     _limit_key_changes(who)
     from app import provider_keys, providers
+
+    if add:
+        if provider != "jina":
+            raise ApiError("single_key_provider",
+                           f"{provider} takes one key; save it to replace the current one")
+        await provider_keys.refresh(session, force=True)
+        if len(provider_keys.entries(provider)) >= settings.jina_max_keys:
+            raise ApiError("key_pool_full",
+                           f"{provider} already has {settings.jina_max_keys} keys; remove one first")
 
     async with httpx.AsyncClient(timeout=providers.TIMEOUT_S) as client:
         if provider == "jina":
@@ -838,9 +861,14 @@ async def put_provider_key(
             if status == "unknown":
                 raise ApiError("invalid_provider_key", "TypeSafe could not be reached to check "
                                "this key; try again", status=503, retry_after=30)
+    _refund_key_change(who)
+    added = True
     try:
-        await provider_keys.save(session, provider, body.key, who.name,
-                                 getattr(request.state, "request_id", None))
+        rid = getattr(request.state, "request_id", None)
+        if add:
+            added = await provider_keys.add(session, provider, body.key, who.name, rid)
+        else:
+            await provider_keys.save(session, provider, body.key, who.name, rid)
     except provider_keys.KeyStoreUnavailable as e:
         raise ApiError("key_store_unavailable", str(e)) from e
     providers.reset_cache()
@@ -850,7 +878,59 @@ async def put_provider_key(
     log.info("provider_key_saved", extra={"provider": provider, "by": who.name,
                                           "resumed_jobs": resumed})
     return {"provider": provider, "status": status, "balance_tokens": balance,
-            "last4": body.key[-4:], "resumed_jobs": resumed}
+            "last4": body.key[-4:], "resumed_jobs": resumed,
+            "already_saved": not added,
+            "keys": len(provider_keys.entries(provider))}
+
+
+@app.put("/providers/keys/{name}")
+async def put_provider_key(
+    name: str,
+    body: ProviderKeyBody,
+    request: Request,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Check the key with the provider, then save it encrypted as the provider's ONLY
+    key. A Jina key with enough credit also resumes the jobs that paused because Jina
+    ran out."""
+    return await _store_provider_key(name, body, request, who, session, add=False)
+
+
+@app.post("/providers/keys/{name}")
+async def add_provider_key(
+    name: str,
+    body: ProviderKeyBody,
+    request: Request,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Check the key, then ADD it to the provider's pool (Jina). Requests rotate across
+    the pool, and JINA_RPM applies per key. Adding a key that is already saved is a
+    no-op (already_saved: true)."""
+    return await _store_provider_key(name, body, request, who, session, add=True)
+
+
+@app.delete("/providers/keys/{name}/{key_id}")
+async def delete_one_provider_key(
+    name: str,
+    key_id: uuid.UUID,
+    request: Request,
+    who: Principal = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Remove one key from the pool."""
+    _require_admin(who)
+    provider = _provider(name)
+    _limit_key_changes(who)
+    from app import provider_keys, providers
+
+    if not await provider_keys.remove(session, provider, str(key_id), who.name,
+                                      getattr(request.state, "request_id", None)):
+        raise ApiError("key_not_found", "no saved key with that id")
+    log.info("provider_key_removed", extra={"provider": provider, "by": who.name})
+    providers.reset_cache()
+    return {"provider": provider, **provider_keys.describe()[provider]}
 
 
 @app.delete("/providers/keys/{name}")
@@ -887,6 +967,14 @@ def _limit_key_changes(who: Principal) -> None:
                        retry_after=int(60 - (now - recent[0])) + 1)
     recent.append(now)
     _key_changes[who.name] = recent
+
+
+def _refund_key_change(who: Principal) -> None:
+    """A key the provider accepted does not count: the limit is there to stop keys
+    being tried in bulk, and an admin pasting a pool of good keys is not that."""
+    recent = _key_changes.get(who.name)
+    if recent:
+        recent.pop()
 
 
 async def _resume_paused_for(session: AsyncSession, reason: str) -> int:

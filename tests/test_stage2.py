@@ -34,7 +34,9 @@ def test_classify_mx(hosts, expected):
 def test_dns_error_class():
     assert DnsResult(resolves=True).error_class is None
     assert DnsResult(resolves=False, nxdomain=True).error_class == "permanent"
-    assert DnsResult(resolves=False, nxdomain=False).error_class == "transient"
+    # No address records is an answer too; only a lookup that FAILED is transient.
+    assert DnsResult(resolves=False, nxdomain=False).error_class == "permanent"
+    assert DnsResult(resolves=False, transient=True).error_class == "transient"
 
 
 # --- parked detection -----------------------------------------------------

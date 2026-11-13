@@ -291,7 +291,7 @@ async def complete_if_finished(session: AsyncSession, job_id: uuid.UUID,
 # gave up on it, as opposed to a site that answered and had nothing (not_found,
 # parked, blocked, not_html, ...). Re-running exactly these by hand after the 16k run
 # lifted its found rate from 44% to 55%.
-RETRYABLE_FAILURE_REASONS = ("homepage", "dns", "circuit_open", "domain_timeout",
+RETRYABLE_FAILURE_REASONS = ("homepage", "dns", "dns_timeout", "circuit_open", "domain_timeout",
                              "internal_error", "private_address")
 
 

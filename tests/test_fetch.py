@@ -334,7 +334,7 @@ async def test_409_token_budget_is_permanent_and_costs_nothing():
 
 def test_jina_headers_carry_target_selector_and_budget():
     from app.pipeline.fetch import JinaFetcher as J
-    h = J(gate())._headers()
+    h = J(gate())._headers("k")
     assert "X-Target-Selector" in h
     for needed in ("footer", "mailto:", "data-cfemail", "application/ld+json", "tel:"):
         assert needed in h["X-Target-Selector"]

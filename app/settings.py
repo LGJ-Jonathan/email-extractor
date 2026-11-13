@@ -47,10 +47,32 @@ class Settings(BaseSettings):
         return v
 
     # Fetching
-    fetch_backend: Literal["jina", "httpx"] = "jina"
+    # jina:   every page through r.jina.ai (plain fetch from Jina's network).
+    # httpx:  every page fetched by us, no provider.
+    # hybrid: fetch each page ourselves first; Jina takes the pages we could not get
+    #         (blocked, timed out, a JavaScript shell), and a domain that ends with no
+    #         address gets a second pass through Jina's headless browser.
+    fetch_backend: Literal["jina", "httpx", "hybrid"] = "jina"
+    # hybrid: a directly fetched page showing less text than this is taken to be a
+    # JavaScript shell and fetched again through Jina's browser.
+    hybrid_thin_text_chars: int = 200
+    # hybrid: re-fetch through Jina's browser when a domain ends with no address.
+    hybrid_second_pass: bool = True
+    hybrid_second_pass_pages: int = 3
+    # X-Engine for rendered fetches. Empty omits the header, which is Jina's default
+    # engine: a headless browser that runs the page's JavaScript.
+    jina_render_engine: str = ""
+    # A rendered page takes "low seconds", against a few hundred ms for a plain fetch.
+    jina_render_timeout_s: int = 20
     jina_api_key: str = ""
     jina_rpm: int = 500
     jina_timeout_s: int = 10
+    # JINA_RPM is per key: with several keys in the pool the shared budget is
+    # JINA_RPM x the keys currently usable. Jina limits each key separately, but keys
+    # of ONE account may share a limit; set this to false if adding keys only brings
+    # 429s (the bucket also slows itself down on every 429).
+    jina_rpm_per_key: bool = True
+    jina_max_keys: int = 20
     # base64 of 32 random bytes; required to save provider keys from the portal.
     provider_key_encryption_key: str = ""
     # Saving a Jina key resumes jobs paused for Jina credit only above this balance;
@@ -101,6 +123,12 @@ class Settings(BaseSettings):
     max_domain_attempts: int = 3
     retry_pass_delay_s: int = 600        # delay before re-running transient failures (spec 17)
     user_agent: str = "Mozilla/5.0 (compatible; ContactFinder/1.0)"
+    # hybrid's direct fetches. A self-declared bot is refused by a good share of small
+    # business sites that would serve a browser; each refusal costs a Jina call.
+    direct_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    )
 
     # Database pool, per process. The worker's domains hold a connection only for short
     # transactions, so this need not match GLOBAL_FETCH_CONCURRENCY; API + worker must

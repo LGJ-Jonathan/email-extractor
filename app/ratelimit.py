@@ -20,7 +20,11 @@ class TokenBucket:
     10-request burst).
     """
 
-    def __init__(self, rate_per_minute: int, capacity: int | None = None) -> None:
+    def __init__(self, rate_per_minute: int, capacity: int | None = None,
+                 scale=None) -> None:
+        # scale(): multiplies rate and burst, read on every refill (the number of
+        # usable provider keys, which changes while the process runs).
+        self._scale = scale
         self.rate_per_minute = rate_per_minute
         self._rate = rate_per_minute / 60.0
         # Burst capacity is deliberately small: a tenth of the minute budget could fire 50
@@ -33,16 +37,21 @@ class TokenBucket:
         self._penalty_factor = 1.0
         self._penalty_until = 0.0
 
+    def _k(self) -> float:
+        return max(1.0, self._scale()) if self._scale else 1.0
+
     def _effective_rate(self) -> float:
+        rate = self._rate * self._k()
         if time.monotonic() < self._penalty_until:
-            return self._rate * self._penalty_factor
-        return self._rate
+            return rate * self._penalty_factor
+        return rate
 
     def _refill(self) -> None:
         now = time.monotonic()
         elapsed = now - self._updated
         self._updated = now
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._effective_rate())
+        self._tokens = min(self._capacity * self._k(),
+                           self._tokens + elapsed * self._effective_rate())
 
     def penalize(self, fraction: float = 0.25, seconds: float = 60.0) -> None:
         """Slow the bucket after a provider 429 (spec 17, level 1)."""
@@ -98,13 +107,14 @@ class RedisTokenBucket:
     """
 
     def __init__(self, redis_url: str, rate_per_minute: int, name: str = "jina",
-                 capacity: int | None = None, client=None) -> None:
+                 capacity: int | None = None, client=None, scale=None) -> None:
+        self._scale = scale
         self.rate_per_minute = rate_per_minute
         self._rate = rate_per_minute / 60.0
         self._capacity = float(capacity if capacity is not None else max(1, rate_per_minute // 50))
         self._key = f"ratelimit:{name}:bucket"
         self._penalty_key = f"ratelimit:{name}:penalty"
-        self._fallback = TokenBucket(rate_per_minute, capacity)
+        self._fallback = TokenBucket(rate_per_minute, capacity, scale=scale)
         self._redis_url = redis_url
         self._client = client
         self._script = None
@@ -126,9 +136,10 @@ class RedisTokenBucket:
 
     async def _try(self, n: int, now: float | None = None) -> float:
         script = self._redis()
+        k = max(1.0, self._scale()) if self._scale else 1.0
         raw = await script(
             keys=[self._key, self._penalty_key],
-            args=[self._rate, self._capacity, time.time() if now is None else now, n],
+            args=[self._rate * k, self._capacity * k, time.time() if now is None else now, n],
         )
         return float(raw.decode() if isinstance(raw, bytes) else raw)
 

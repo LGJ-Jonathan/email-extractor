@@ -64,6 +64,9 @@ ERROR_CODES: dict[str, tuple[int, str]] = {
     "busy": (503, "other large uploads are being processed; retry shortly"),
     "invalid_provider_key": (422, "the provider rejected this key"),
     "key_rate_limited": (429, "too many key changes; wait a minute"),
+    "key_pool_full": (409, "the provider already has the most keys it may hold"),
+    "single_key_provider": (409, "this provider takes one key; PUT replaces it"),
+    "key_not_found": (404, "no saved key with that id for this provider"),
     "key_store_unavailable": (503, "PROVIDER_KEY_ENCRYPTION_KEY is not configured"),
 }
 

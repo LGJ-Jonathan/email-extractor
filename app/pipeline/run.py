@@ -42,7 +42,10 @@ log = logging.getLogger("email_extractor.pipeline")
 # verified on the 16k run, where all 3,095 of them had n_pages=0 -- so retrying is
 # free except for time. Doing it by hand after that run recovered 1,849 of 3,404.
 # domain_timeout is deliberately NOT here: it means we already spent the budget.
-RETRYABLE_DOMAIN_REASONS = frozenset({"circuit_open"})
+#
+# dns_timeout is the same idea one stage earlier: the lookup failed without an answer,
+# so nothing is known about the domain and nothing was spent.
+RETRYABLE_DOMAIN_REASONS = frozenset({"circuit_open", "dns_timeout"})
 
 MIN_RETRY_DELAY_S = 1.0
 MAX_RETRY_DELAY_S = 60.0
@@ -65,6 +68,8 @@ class Scratch:
     home_html: str = ""
     pages: list[tuple[str, int, str]] = field(default_factory=list)
     tokens: int = 0
+    # url -> how it was fetched (direct | jina | jina_render), for the second pass.
+    via: dict[str, str] = field(default_factory=dict)
     # Stages 5-6 over `pages`, keyed by how many pages there were: judging and
     # harvesting both need it, and it is the domain's biggest slice of CPU.
     extracted: tuple[int, tuple] | None = None
@@ -216,10 +221,12 @@ async def _process(
     dns: DnsResult = await check_domain(domain)
     scratch.dns = dns
     if not dns.resolves:
+        if dns.transient:
+            log.warning("dns_timeout", extra={"domain": domain, "err": dns.error})
         return _result(
             domain,
             status="fetch_failed",
-            error_reason="dns",
+            error_reason="dns_timeout" if dns.transient else "dns",
             mx_provider=dns.mx_provider,
         )
 
@@ -284,13 +291,17 @@ async def _process(
     # as we go so the early stop can fire before wave 3 is spent.
     scratch.pages.append((home.final_url, 0, home.html))
     scratch.tokens += home.jina_tokens or 0
+    scratch.via[home.final_url] = home.via
     pages = scratch.pages
 
     async def fetch_page(c) -> tuple[str, int, str, int]:
         try:
             r = await fetcher.get_html(c.target, domain=domain)
+            scratch.via[r.final_url] = r.via
             return r.final_url, c.score, r.html, (r.jina_tokens or 0)
-        except FetchError:
+        except FetchError as e:
+            if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
+                raise            # every key is spent: pause the job, do not skip pages
             return c.target, c.score, "", 0
 
     contact = next((c for c in selected if c.tier == "contact"), None)
@@ -318,8 +329,56 @@ async def _process(
             if html:
                 pages.append((url, score, html))
 
+    await _second_pass(domain, fetcher, scratch)
     judgment = await _judge_pages(domain, scratch)
     return _harvest(domain, scratch, judgment=judgment, started=started)
+
+
+async def _second_pass(domain: str, fetcher: Fetcher, scratch: Scratch) -> None:
+    """No address on the pages as fetched: look again the way a browser sees them.
+
+    Only with a fetcher that can render (FETCH_BACKEND=hybrid). A site that writes its
+    contact details in with JavaScript shows a plain fetch a full page with no address
+    in it, so "the fetch worked" says nothing about whether the address was there to
+    find. The best pages first (homepage, then by discovery score), a few at most, and
+    never one that was already rendered.
+    """
+    render = getattr(fetcher, "render_html", None)
+    if render is None or not settings.hybrid_second_pass:
+        return
+    ranked, _p, _s, _f = await asyncio.to_thread(_extract_all, scratch)
+    if ranked:
+        return
+    order = sorted(range(len(scratch.pages)),
+                   key=lambda i: (i != 0, -scratch.pages[i][1]))
+    todo = [i for i in order if scratch.via.get(scratch.pages[i][0]) != "jina_render"]
+    todo = todo[: max(0, settings.hybrid_second_pass_pages)]
+    if not todo:
+        return
+
+    async def rerender(i: int):
+        url, score, _html = scratch.pages[i]
+        try:
+            return i, await render(url, domain=domain)
+        except FetchError as e:
+            if e.error_class is ErrorClass.PROVIDER_ACCOUNT:
+                raise
+            return i, None
+
+    replaced = 0
+    for i, r in await asyncio.gather(*(rerender(i) for i in todo)):
+        if r is None or not r.html:
+            continue
+        url, score, _old = scratch.pages[i]
+        scratch.pages[i] = (url, score, r.html)
+        scratch.via[url] = r.via
+        scratch.tokens += r.jina_tokens or 0
+        replaced += 1
+        if i == 0:
+            scratch.home_html = r.html
+    if replaced:
+        scratch.extracted = None          # same page count, different pages
+    log.info("second_pass", extra={"domain": domain, "pages": len(todo), "rendered": replaced})
 
 
 def _extract_all(scratch: Scratch):
@@ -365,7 +424,10 @@ def _extract_pages(scratch: Scratch):
 
 
 async def _judge_pages(domain: str, scratch: Scratch):
-    ranked, _p, _s, _f = _extract_all(scratch)
+    # Off the event loop: parsing a domain's pages is its biggest slice of CPU, and
+    # with 50+ domains in flight it stalled everything else that shares the loop
+    # (DNS answers arrived on time and were read too late).
+    ranked, _p, _s, _f = await asyncio.to_thread(_extract_all, scratch)
     from app.pipeline.extract.context import page_title
 
     title = page_title(scratch.home_html)

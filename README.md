@@ -58,6 +58,22 @@ Run these inside the API service: `railway ssh --service email-extractor -- pyth
 Limits per person: 3 unfinished jobs, 50,000 rows / 50 MB per job, 120 requests a
 minute (status polling exempt). Someone else's job is a 404.
 
+## Fetch backends
+
+`FETCH_BACKEND` picks how pages are fetched:
+
+| Value | What it does |
+| --- | --- |
+| `jina` | Every page through r.jina.ai (`X-Engine: direct`, a plain fetch from Jina's network). Paced by `JINA_RPM`. |
+| `httpx` | Every page fetched by the worker itself. No provider, no JavaScript. |
+| `hybrid` | The worker fetches each page itself. Jina takes the pages it could not get: a site that refuses or stalls on our address (plain fetch from Jina's network), and a page that shows under `HYBRID_THIN_TEXT_CHARS` of text (Jina's headless browser, which runs the JavaScript). A domain that still ends with no address gets a second pass: its best `HYBRID_SECOND_PASS_PAGES` pages re-fetched in the browser. |
+
+With `hybrid` most domains never touch Jina, so `JINA_RPM` stops being the ceiling;
+throughput is then `GLOBAL_FETCH_CONCURRENCY` (domains in flight per worker) times the
+number of worker processes. The queue, the domain locks and the Redis rate limit are
+shared, so adding worker replicas is safe; keep API + workers under Postgres's
+connection limit (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW` each).
+
 ## Provider keys (Jina, TypeSafe)
 
 Admins set them in the portal (Email Extractor → Provider keys). Each key is checked
@@ -90,7 +106,8 @@ Every route except `/healthz` and `/` requires `X-API-Key`.
 | `POST /jobs/{id}/retry` | send the job's retryable failures (unreachable, slow, provider trouble, gave up) back to the queue; finished rows keep their results, a done job goes back to running |
 | `GET /estimate?domains=N` | time range for N domains at this person's fair share of recent speed |
 | `GET /providers/status` | Jina balance, TypeSafe key status, this month's usage, and `worker`: `ok` / `silent` / `never_seen` with `last_seen_s`, `in_flight`, `last_claim_at` and the breaker state, so a stalled worker does not look like a slow job |
-| `GET` / `PUT` / `DELETE /providers/keys[/{jina\|typesafe}]` | admin: view / check-and-save / remove provider keys |
+| `GET` / `PUT` / `DELETE /providers/keys[/{jina\|typesafe}]` | admin: view / check-and-save (as the only key) / remove provider keys |
+| `POST /providers/keys/jina`, `DELETE /providers/keys/jina/{id}` | admin: add a key to the Jina pool / remove one. Requests rotate across the pool, `JINA_RPM` applies per key (`JINA_RPM_PER_KEY=false` if the keys share one limit), and a key answering 401/402 is benched (1 h / 15 min) while the others carry on; jobs pause only when every key is spent |
 | `POST /extract` | one domain, synchronously |
 
 Every error is `{"error": {"code", "message", "retry_after", "details"}, "detail",
