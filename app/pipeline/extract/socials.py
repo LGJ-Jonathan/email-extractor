@@ -46,8 +46,14 @@ def extract_socials(html: str, base_url: str = "") -> dict[str, str]:
         href = (node.attributes.get("href") or "").strip()
         if not href or href.startswith("#"):
             continue
-        parts = urlsplit(href if "//" in href else "https://" + href.lstrip("/"))
-        host = (parts.hostname or "").lower()
+        try:
+            parts = urlsplit(href if "//" in href else "https://" + href.lstrip("/"))
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            # A malformed link ("http://[foo", a stray bracket): urlsplit raises
+            # "Invalid IPv6 URL", and one bad href used to fail the whole domain as
+            # internal_error after its pages had been fetched and paid for.
+            continue
         path = parts.path or "/"
         if not host or _DROP_PATH.search(path):
             continue

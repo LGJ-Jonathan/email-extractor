@@ -660,7 +660,10 @@ class JinaFetcher(_BaseFetcher):
                     # Only genuine provider trouble may move the breaker. 409 is our
                     # own token budget refusing a page and 422 is the target serving a
                     # non-HTML content type -- neither means Jina is unhealthy.
-                    provider=cls in (ErrorClass.TRANSIENT, ErrorClass.PROVIDER_ACCOUNT),
+                    # A spent or rejected KEY is ours to fix, not Jina being unwell: it
+                    # pauses the job (or rotates keys) and must not also open the
+                    # breaker, which then throttled the first minute after a top-up.
+                    provider=cls is ErrorClass.TRANSIENT,
                 )
 
             try:

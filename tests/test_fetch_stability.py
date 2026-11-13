@@ -569,3 +569,23 @@ def test_normalising_a_large_whitespace_heavy_page_is_fast():
     t = time.perf_counter()
     assert normalize_html(html) == html
     assert time.perf_counter() - t < 0.5          # was 2.7 s
+
+
+def test_a_malformed_link_does_not_fail_the_domain():
+    from app.pipeline.extract.socials import extract_socials
+
+    html = ('<a href="http://[broken">x</a><a href="https://[::1">y</a>'
+            '<a href="https://www.facebook.com/acmeroofing">fb</a>')
+    assert extract_socials(html, "https://acme.com/") == {
+        "facebook": "https://www.facebook.com/acmeroofing"}
+
+
+@respx.mock
+async def test_a_spent_key_does_not_open_the_breaker():
+    respx.get(url__startswith="https://r.jina.ai/").mock(return_value=httpx.Response(402))
+    g = gate()
+    f = JinaFetcher(g)
+    for i in range(40):
+        with pytest.raises(FetchError):
+            await f.get_html(f"https://site{i}.com/")
+    assert g.breaker.opened_count == 0
